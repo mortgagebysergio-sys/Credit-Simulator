@@ -368,5 +368,3 @@ with colA:
             f"Estimated gain: **+{r.estimated_points_low} to +{r.estimated_points_high}** (posts ~{r.timeline_days} days)  \n"
             f"Why: {r.why}"
         )
-streamlit==1.37.1
-pdfplumber==0.11.4
