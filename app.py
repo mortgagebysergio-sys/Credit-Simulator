@@ -358,60 +358,50 @@ def tradelines_to_df(lines: List[Tradeline]) -> pd.DataFrame:
             "last_reported", "opened_date", "status", "bureaus", "account_type", "notes"
         ])
     return df
-    def df_to_tradelines(obj) -> List[Tradeline]:
+def df_to_tradelines(obj) -> List[Tradeline]:
     """
-    Accepts either:
-      - pandas DataFrame (preferred)
-      - list[dict] or list[Tradeline] (fallback)
-    Returns list[Tradeline].
+    Safely converts DataFrame or list into List[Tradeline]
     """
-    # Already a list of Tradeline objects
-    if isinstance(obj, list) and len(obj) > 0 and isinstance(obj[0], Tradeline):
-        return obj
 
-    # list of dicts -> DataFrame
+    # Convert list to DataFrame if needed
     if isinstance(obj, list):
         try:
             obj = pd.DataFrame(obj)
-        except Exception:
+        except:
             return []
 
-    # Must be DataFrame now
     if not isinstance(obj, pd.DataFrame):
         return []
 
-    df = obj.copy()
+    tradelines = []
 
-    out: List[Tradeline] = []
-    for _, r in df.iterrows():
-        # balance
+    for _, r in obj.iterrows():
+
+        # balance handling
         bal = r.get("balance", None)
-        bal_f = None
         try:
-            if bal is not None and not pd.isna(bal) and str(bal).strip() != "":
-                bal_f = float(str(bal).replace("$", "").replace(",", "").strip())
-        except Exception:
-            bal_f = None
+            if bal not in (None, ""):
+                bal = float(str(bal).replace("$", "").replace(",", ""))
+            else:
+                bal = None
+        except:
+            bal = None
 
-        # account number: prefer full, else last4
-        acct_full = str(r.get("account_number", "") or "").strip()
-        acct_last4 = str(r.get("account_last4", "") or "").strip()
-        acct_num = acct_full if acct_full else acct_last4
-
-        out.append(
+        tradelines.append(
             Tradeline(
-                creditor_name=str(r.get("creditor_name", "") or "").strip(),
-                account_number=acct_num,
-                balance=bal_f,
-                last_reported=str(r.get("last_reported", "") or "").strip(),
-                opened_date=str(r.get("opened_date", "") or "").strip(),
-                status=str(r.get("status", "") or "").strip(),
-                bureaus=str(r.get("bureaus", "") or "").strip(),
-                account_type=str(r.get("account_type", "") or "").strip(),
-                notes=str(r.get("notes", "") or "").strip(),
+                creditor_name=str(r.get("creditor_name", "")),
+                account_number=str(r.get("account_number", "")),
+                balance=bal,
+                last_reported=str(r.get("last_reported", "")),
+                opened_date=str(r.get("opened_date", "")),
+                status=str(r.get("status", "")),
+                bureaus=str(r.get("bureaus", "")),
+                account_type=str(r.get("account_type", "")),
+                notes=str(r.get("notes", ""))
             )
         )
-    return out
+
+    return tradelines
     """
     Accepts either:
       - pandas DataFrame (preferred)
