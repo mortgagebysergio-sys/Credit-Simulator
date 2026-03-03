@@ -358,9 +358,7 @@ def tradelines_to_df(lines: List[Tradeline]) -> pd.DataFrame:
             "last_reported", "opened_date", "status", "bureaus", "account_type", "notes"
         ])
     return df
-
-
-(working_df, list):     working_df = pd.DataFrame(working_df)(obj) -> List[Tradeline]:
+    
     """
     Accepts either:
       - pandas DataFrame (preferred)
