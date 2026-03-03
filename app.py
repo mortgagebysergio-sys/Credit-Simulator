@@ -360,7 +360,7 @@ def tradelines_to_df(lines: List[Tradeline]) -> pd.DataFrame:
     return df
 
 
-def if isinstance(working_df, list):     working_df = pd.DataFrame(working_df)(obj) -> List[Tradeline]:
+(working_df, list):     working_df = pd.DataFrame(working_df)(obj) -> List[Tradeline]:
     """
     Accepts either:
       - pandas DataFrame (preferred)
