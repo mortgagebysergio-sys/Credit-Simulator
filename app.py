@@ -1,1209 +1,1175 @@
 import io
 import re
-import time
 import math
-import hashlib
 from dataclasses import dataclass, asdict
-from datetime import datetime
+from datetime import datetime, date
 from typing import List, Dict, Tuple, Optional
 
-import streamlit as st
 import pandas as pd
+import streamlit as st
 
-# Primary PDF engine
 import fitz  # PyMuPDF
-
-# Optional secondary extractor
-import pdfplumber
-
-# OCR
 from PIL import Image
 import pytesseract
 
-# PDF export
-from reportlab.lib.pagesizes import LETTER
-from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import letter
 from reportlab.lib.units import inch
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+from reportlab.lib import colors
+from reportlab.lib.styles import getSampleStyleSheet
 
 
-# =============================================================================
+# -----------------------------
 # App Config
-# =============================================================================
-APP_TITLE = "Mortgage Rapid Rescore / Credit Score Simulator"
-PII_MASK = True                  # mask account numbers in UI
-MAX_PAGES_OCR = 25               # cap OCR pages for Streamlit Cloud
-OCR_RENDER_SCALE = 2.0           # bigger = better OCR, slower
-
+# -----------------------------
 st.set_page_config(
-    page_title=APP_TITLE,
-    page_icon="📈",
+    page_title="Negative Accounts Extractor",
+    page_icon="📄",
     layout="wide",
-    initial_sidebar_state="expanded",
 )
 
-DISCLAIMER = (
-    "⚠️ **Disclaimer:** This simulator provides **estimates** only. Actual score changes vary by bureau, model "
-    "(FICO/Vantage), file thickness, timing, and how creditors/bureaus report. Results are **not guaranteed**."
-)
-PRIVACY_NOTE = (
-    "🔒 **Privacy:** PDFs are processed **in-memory** only. The app does **not** intentionally store your PDF. "
-    "Account numbers are masked by default."
-)
+TODAY = date.today()
 
+# -----------------------------
+# Safety / PII masking helpers
+# -----------------------------
+ACCT_LIKE_RE = re.compile(r"(?<!\d)(?:X{2,}|\*{2,}|\d)[Xx\*\-\s\d]{5,}(?!\d)")
+DIGIT_RUN_RE = re.compile(r"(?<!\d)(\d[\d\-\s]{6,}\d)(?!\d)")
+
+
+def mask_account_number(raw: str) -> str:
+    """
+    Keep only last 4 digits if present. If no digits, return masked token.
+    Examples:
+      '1234567890' -> '••••6789'
+      'XXXXXX1234' -> '••••1234'
+      '***-**-1234' -> '••••1234'
+    """
+    if not raw:
+        return ""
+    digits = re.sub(r"\D", "", raw)
+    if len(digits) >= 4:
+        return f"••••{digits[-4:]}"
+    return "••••"
+
+
+def mask_pii_in_snippet(text: str) -> str:
+    """
+    Mask account-like sequences in debug snippets. Keeps last 4 digits.
+    """
+    if not text:
+        return ""
+
+    def repl(m):
+        token = m.group(0)
+        digits = re.sub(r"\D", "", token)
+        if len(digits) >= 4:
+            return f"••••{digits[-4:]}"
+        return "••••"
+
+    # Mask explicit account-like strings (X/*/digits runs)
+    text = ACCT_LIKE_RE.sub(repl, text)
+    # Mask long digit runs too
+    text = DIGIT_RUN_RE.sub(repl, text)
+    return text
+
+
+# -----------------------------
+# Date parsing helpers
+# -----------------------------
 DATE_PATTERNS = [
-    r"\b(0?[1-9]|1[0-2])[\/\-](0?[1-9]|[12]\d|3[01])[\/\-](\d{2}|\d{4})\b",
-    r"\b(?:jan|january|feb|february|mar|march|apr|april|may|jun|june|jul|july|aug|august|sep|sept|september|oct|october|nov|november|dec|december)\.?\s+(0?[1-9]|[12]\d|3[01])[,]?\s+(\d{4})\b",
+    # mm/dd/yyyy or m/d/yyyy
+    re.compile(r"\b(0?[1-9]|1[0-2])[\/\-](0?[1-9]|[12]\d|3[01])[\/\-]((?:19|20)\d{2})\b"),
+    # mm/yyyy or m/yyyy
+    re.compile(r"\b(0?[1-9]|1[0-2])[\/\-]((?:19|20)\d{2})\b"),
+    # yyyy-mm-dd
+    re.compile(r"\b((?:19|20)\d{2})[\/\-](0?[1-9]|1[0-2])[\/\-](0?[1-9]|[12]\d|3[01])\b"),
 ]
 
-MONEY_PATTERN = r"\$?\s*\(?\s*\d{1,3}(?:,\d{3})*(?:\.\d{2})?\s*\)?"
-ACCT_PATTERN = r"(?:\*{2,}|\bx{2,}\b|#)?\s*[0-9xX\*]{4,}"
 
-NEGATIVE_KEYWORDS = {
-    "collection": ["collection", "collections", "coll"],
-    "charge_off": ["charge off", "charged off", "charge-off", "c/o", "co"],
-    "late": ["30 days", "60 days", "90 days", "120 days", "late", "delinquent"],
-    "repossession": ["repo", "repossession"],
-    "bankruptcy": ["bankruptcy", "chapter 7", "chapter 13"],
-    "foreclosure": ["foreclosure"],
-    "judgment": ["judgment"],
-}
-
-BUREAU_HINTS = {
-    "Experian": ["experian"],
-    "Equifax": ["equifax"],
-    "TransUnion": ["transunion", "trans union"],
-}
-
-REVOLVING_HINTS = ["revolving", "credit card", "bankcard", "visa", "mastercard", "discover", "amex"]
-INSTALLMENT_HINTS = ["installment", "auto", "student", "mortgage", "loan"]
-
-
-# =============================================================================
-# Utilities
-# =============================================================================
-def now_str() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
-def stable_hash_bytes(b: bytes) -> str:
-    return hashlib.sha256(b).hexdigest()[:12]
-
-
-def normalize_whitespace(s: str) -> str:
-    s = s.replace("\r", "\n")
-    s = re.sub(r"[ \t]+", " ", s)
-    s = re.sub(r"\n{3,}", "\n\n", s)
-    return s.strip()
-
-
-def safe_snip(text: str, limit: int = 2500) -> str:
-    if len(text) <= limit:
-        return text
-    return text[:limit] + "\n…(truncated)…"
-
-
-def mask_account_number(acct: str) -> str:
-    if not acct:
-        return ""
-    digits = re.sub(r"[^0-9]", "", str(acct))
-    if len(digits) >= 4:
-        return f"****{digits[-4:]}"
-    raw = str(acct).strip().replace(" ", "")
-    return f"****{raw[-4:]}" if len(raw) >= 4 else "****"
-
-
-def parse_money_to_float(s: str) -> Optional[float]:
-    if not s:
+def parse_date_from_text(text: str) -> Optional[date]:
+    if not text:
         return None
-    s = str(s).strip()
-    neg = "(" in s and ")" in s
-    s = s.replace("$", "").replace(",", "").replace("(", "").replace(")", "")
-    s = re.sub(r"[^\d\.]", "", s)
-    if not s:
-        return None
-    try:
-        v = float(s)
-        return -v if neg else v
-    except Exception:
-        return None
+    t = text.strip()
 
-
-def coerce_float(x) -> Optional[float]:
-    if x is None:
-        return None
-    if isinstance(x, (int, float)) and not (isinstance(x, float) and math.isnan(x)):
-        return float(x)
-    s = str(x).strip()
-    if s == "" or s.lower() == "nan":
-        return None
-    return parse_money_to_float(s)
-
-
-def detect_bureaus(text: str) -> List[str]:
-    t = text.lower()
-    present = []
-    for bureau, hints in BUREAU_HINTS.items():
-        if any(h in t for h in hints):
-            present.append(bureau)
-    return present or ["Unknown"]
-
-
-def classify_status(block: str) -> Tuple[str, List[str]]:
-    b = block.lower()
-    matched = []
-    for k, kws in NEGATIVE_KEYWORDS.items():
-        if any(kw in b for kw in kws):
-            matched.append(k)
-
-    priority = ["bankruptcy", "foreclosure", "judgment", "repossession", "charge_off", "collection", "late"]
-    for p in priority:
-        if p in matched:
-            return p, matched
-    return "ok", matched
-
-
-def guess_account_type(block: str) -> str:
-    b = block.lower()
-    if any(h in b for h in REVOLVING_HINTS):
-        return "revolving"
-    if any(h in b for h in INSTALLMENT_HINTS):
-        return "installment"
-    return "unknown"
-
-
-def extract_dates(block: str) -> List[str]:
-    out = []
-    for pat in DATE_PATTERNS:
-        out.extend(re.findall(pat, block, flags=re.IGNORECASE))
-    # re.findall returns tuples for patterns with groups; normalize:
-    flat = []
-    for x in out:
-        if isinstance(x, tuple):
-            flat.append(" ".join([str(i) for i in x if str(i).strip()]))
-        else:
-            flat.append(str(x))
-    # Better approach: just regex-iterate for full match
-    matches = []
-    for pat in DATE_PATTERNS:
-        for m in re.finditer(pat, block, flags=re.IGNORECASE):
-            matches.append(m.group(0))
-    # de-dupe preserve order
-    seen = set()
-    uniq = []
-    for d in matches:
-        key = d.lower()
-        if key not in seen:
-            uniq.append(d)
-            seen.add(key)
-    return uniq
-
-
-def pick_last_reported_date(block: str) -> str:
-    dates = extract_dates(block)
-    if not dates:
-        return ""
-    anchor = re.search(
-        r"(last\s+reported|reported\s+on|date\s+reported|as\s+of)\s*[:\-]?\s*(.*)$",
-        block,
-        flags=re.IGNORECASE,
-    )
-    if anchor:
-        tail_dates = extract_dates(anchor.group(0))
-        if tail_dates:
-            return tail_dates[0]
-    return dates[-1]
-
-
-def pick_balance(block: str) -> Optional[float]:
-    m = re.search(
-        r"(balance|current\s+balance|amt\s+due|amount\s+due)\s*[:\-]?\s*(" + MONEY_PATTERN + r")",
-        block,
-        flags=re.IGNORECASE,
-    )
+    # Try mm/dd/yyyy
+    m = DATE_PATTERNS[0].search(t)
     if m:
-        return parse_money_to_float(m.group(2))
-
-    vals = []
-    for m2 in re.finditer(MONEY_PATTERN, block):
-        v = parse_money_to_float(m2.group(0))
-        if v is None:
-            continue
-        if abs(v) < 1:
-            continue
-        vals.append(v)
-    if not vals:
-        return None
-    return sorted(vals, key=lambda x: abs(x), reverse=True)[0]
-
-
-def pick_creditor_name(block: str) -> str:
-    lines = [ln.strip() for ln in block.splitlines() if ln.strip()]
-    if not lines:
-        return ""
-    def score(ln: str) -> float:
-        l = ln.strip()
-        if len(l) < 4:
-            return -10
-        if re.search(r"\b(account|acct|opened|balance|reported|status)\b", l, flags=re.IGNORECASE):
-            return -2
-        digits = sum(ch.isdigit() for ch in l)
-        letters = sum(ch.isalpha() for ch in l)
-        if letters == 0:
-            return -10
-        ratio = letters / max(1, letters + digits)
-        caps = sum(ch.isupper() for ch in l if ch.isalpha())
-        caps_ratio = caps / max(1, letters)
-        return (len(l) * 0.05) + (ratio * 2.0) + (caps_ratio * 0.5) - (digits * 0.2)
-    ranked = sorted(lines[:10], key=score, reverse=True)
-    best = ranked[0]
-    best = re.sub(r"^(creditor|furnisher)\s*[:\-]\s*", "", best, flags=re.IGNORECASE).strip()
-    return best
-
-
-def pick_account_number(block: str) -> str:
-    m = re.search(
-        r"(account|acct|account\s*#|acct\s*#)\s*[:\-]?\s*(" + ACCT_PATTERN + r")",
-        block,
-        flags=re.IGNORECASE,
-    )
-    if m:
-        return m.group(2).strip()
-
-    candidates = []
-    for m2 in re.finditer(ACCT_PATTERN, block, flags=re.IGNORECASE):
-        s = m2.group(0).strip()
-        digits = len(re.sub(r"[^0-9]", "", s))
-        if digits >= 4:
-            candidates.append((digits, s))
-    if not candidates:
-        return ""
-    candidates.sort(reverse=True, key=lambda t: t[0])
-    return candidates[0][1]
-
-
-def split_into_tradeline_blocks(text: str) -> List[str]:
-    t = normalize_whitespace(text)
-    seps = [
-        r"\n\s*[-_]{5,}\s*\n",
-        r"\n\s*={5,}\s*\n",
-        r"\n\s*\*\s*\*\s*\*\s*\*\s*\*\s*\n",
-    ]
-    blocks = [t]
-    for sep in seps:
-        if re.search(sep, t):
-            blocks = re.split(sep, t)
-            break
-    if len(blocks) <= 2:
-        blocks = re.split(r"\n(?=(?:account|acct|creditor|furnisher)\b)", t, flags=re.IGNORECASE)
-
-    cleaned = []
-    for b in blocks:
-        b = b.strip()
-        if len(b) >= 80:
-            cleaned.append(b)
-
-    if len(cleaned) < 4 and len(t) > 4000:
-        paras = [p.strip() for p in t.split("\n\n") if p.strip()]
-        cleaned = [p for p in paras if len(p) >= 120]
-    return cleaned
-
-
-# =============================================================================
-# Data Model
-# =============================================================================
-@dataclass
-class Tradeline:
-    creditor_name: str = ""
-    account_number: str = ""
-    balance: Optional[float] = None
-    credit_limit: Optional[float] = None
-    last_reported: str = ""
-    opened_date: str = ""
-    status: str = "ok"
-    bureaus: str = "Unknown"
-    account_type: str = "unknown"
-    is_negative: bool = False
-    notes: str = ""
-
-
-def tradelines_to_df(lines: List[Tradeline]) -> pd.DataFrame:
-    rows = []
-    for tl in lines:
-        d = asdict(tl)
-        d["account_last4"] = mask_account_number(tl.account_number)
-        rows.append(d)
-    df = pd.DataFrame(rows)
-    if df.empty:
-        df = pd.DataFrame(columns=[
-            "creditor_name", "account_number", "account_last4", "balance", "credit_limit",
-            "last_reported", "opened_date", "status", "bureaus", "account_type", "is_negative", "notes"
-        ])
-    return df
-
-
-def df_to_tradelines(obj) -> List[Tradeline]:
-    """Convert DataFrame (or list-of-dicts) -> List[Tradeline] safely."""
-    if isinstance(obj, list):
+        mm, dd, yyyy = m.group(1), m.group(2), m.group(3)
         try:
-            obj = pd.DataFrame(obj)
-        except Exception:
-            return []
-    if not isinstance(obj, pd.DataFrame):
-        return []
+            return date(int(yyyy), int(mm), int(dd))
+        except ValueError:
+            return None
 
-    out: List[Tradeline] = []
-    for _, r in obj.iterrows():
-        status = str(r.get("status", "ok")).strip().lower() or "ok"
-        is_neg = r.get("is_negative", None)
-        if is_neg is None or str(is_neg).strip() == "":
-            is_neg = (status != "ok")
+    # Try mm/yyyy -> assume day=1 (conservative)
+    m = DATE_PATTERNS[1].search(t)
+    if m:
+        mm, yyyy = m.group(1), m.group(2)
+        try:
+            return date(int(yyyy), int(mm), 1)
+        except ValueError:
+            return None
+
+    # Try yyyy-mm-dd
+    m = DATE_PATTERNS[2].search(t)
+    if m:
+        yyyy, mm, dd = m.group(1), m.group(2), m.group(3)
+        try:
+            return date(int(yyyy), int(mm), int(dd))
+        except ValueError:
+            return None
+
+    return None
+
+
+def format_date(d: Optional[date]) -> str:
+    if not d:
+        return ""
+    return d.strftime("%Y-%m-%d")
+
+
+def calc_age(opened: Optional[date]) -> str:
+    if not opened:
+        return ""
+    # Age in years/months (approx, but stable)
+    months = (TODAY.year - opened.year) * 12 + (TODAY.month - opened.month)
+    if months < 0:
+        return ""
+    years = months // 12
+    rem = months % 12
+    if years <= 0:
+        return f"{rem} mo"
+    if rem == 0:
+        return f"{years} yr"
+    return f"{years} yr {rem} mo"
+
+
+# -----------------------------
+# Money parsing helpers
+# -----------------------------
+MONEY_RE = re.compile(r"(?i)\$?\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{2})?|[0-9]+(?:\.[0-9]{2})?)")
+
+
+def parse_money(text: str) -> Optional[float]:
+    if not text:
+        return None
+    m = MONEY_RE.search(text.replace("O", "0"))
+    if not m:
+        return None
+    val = m.group(1).replace(",", "")
+    try:
+        return float(val)
+    except ValueError:
+        return None
+
+
+def format_money(x: Optional[float]) -> str:
+    if x is None or (isinstance(x, float) and (math.isnan(x))):
+        return ""
+    try:
+        return "${:,.2f}".format(float(x))
+    except Exception:
+        return ""
+
+
+# -----------------------------
+# Bureau detection
+# -----------------------------
+def detect_bureau(text: str) -> List[str]:
+    t = (text or "").lower()
+    bureaus = []
+    if "experian" in t:
+        bureaus.append("Experian")
+    if "equifax" in t:
+        bureaus.append("Equifax")
+    if "transunion" in t or "trans union" in t:
+        bureaus.append("TransUnion")
+    return bureaus
+
+
+def detect_bureau_for_block(block: str, doc_bureaus: List[str]) -> str:
+    """
+    Best effort: detect per-block bureau indicators; fallback to doc-level.
+    """
+    t = (block or "").lower()
+    found = []
+    if "experian" in t or re.search(r"\bex\b", t):
+        found.append("Experian")
+    if "equifax" in t or re.search(r"\beq\b", t):
+        found.append("Equifax")
+    if "transunion" in t or "trans union" in t or re.search(r"\btu\b", t):
+        found.append("TransUnion")
+
+    # If nothing found, use doc-level (if single bureau, assign it)
+    if not found:
+        if len(doc_bureaus) == 1:
+            return doc_bureaus[0]
+        if len(doc_bureaus) > 1:
+            return "Multiple/Unknown"
+        return "Unknown"
+
+    # Deduplicate + return
+    found = list(dict.fromkeys(found))
+    if len(found) == 1:
+        return found[0]
+    return "Multiple/Unknown"
+
+
+# -----------------------------
+# Negative detection + parsing
+# -----------------------------
+NEG_KEYWORDS = [
+    "collection", "collections", "charge off", "charged off", "charge-off", "charged-off",
+    "late", "past due", "delinquent", "30 days late", "60 days late", "90 days late", "120 days late",
+    "repossession", "repo", "repossessed",
+    "bankruptcy", "bk", "chapter 7", "chapter 13",
+    "foreclosure",
+    "judgment", "judgements",
+    "write off", "written off", "write-off",
+]
+
+# For status normalization
+STATUS_MAP = [
+    ("Bankruptcy", ["bankruptcy", "chapter 7", "chapter 13", "bk"]),
+    ("Foreclosure", ["foreclosure"]),
+    ("Judgment", ["judgment", "judgements"]),
+    ("Repossession", ["repossession", "repossessed", " repo "]),
+    ("Charge-off", ["charge off", "charged off", "charge-off", "charged-off", "write off", "written off", "write-off"]),
+    ("Collection", ["collection", "collections"]),
+    ("Late (120+)", ["120 days late", "120+", "120 day"]),
+    ("Late (90)", ["90 days late", "90 day"]),
+    ("Late (60)", ["60 days late", "60 day"]),
+    ("Late (30)", ["30 days late", "30 day"]),
+    ("Late/Delinquent", ["late", "past due", "delinquent"]),
+]
+
+LABEL_PATTERNS = {
+    "creditor": [
+        re.compile(r"(?i)\b(creditor|subscriber|furnisher|company|lender|collection agency|original creditor)\b\s*[:\-]\s*(.+)"),
+        re.compile(r"(?i)\b(account name|name)\b\s*[:\-]\s*(.+)"),
+    ],
+    "account": [
+        re.compile(r"(?i)\b(acct|acct\.|account|account\s*#|account\s*number|a\/c|a\/c\s*#)\b\s*[:\-]?\s*([Xx\*\-\s\d]{4,})"),
+    ],
+    "balance": [
+        re.compile(r"(?i)\b(current\s*balance|balance|bal)\b\s*[:\-]?\s*\$?\s*([0-9,]+(?:\.[0-9]{2})?)"),
+        re.compile(r"(?i)\b(amount\s*owed)\b\s*[:\-]?\s*\$?\s*([0-9,]+(?:\.[0-9]{2})?)"),
+    ],
+    "last_reported": [
+        re.compile(r"(?i)\b(last\s*reported|date\s*reported|reported\s*on|last\s*updated|last\s*update)\b\s*[:\-]?\s*([0-9\/\-]{4,10})"),
+    ],
+    "opened": [
+        re.compile(r"(?i)\b(date\s*opened|opened|open\s*date)\b\s*[:\-]?\s*([0-9\/\-]{4,10})"),
+    ],
+    "status": [
+        re.compile(r"(?i)\b(status|account\s*status|condition|remarks?)\b\s*[:\-]?\s*(.+)"),
+    ],
+}
+
+# Common “block delimiter” markers in bureau reports
+BLOCK_BREAK_HINTS = [
+    "account information",
+    "account details",
+    "trade line",
+    "tradeline",
+    "collection",
+    "public record",
+    "inquiries",
+    "personal information",
+]
+
+
+@dataclass
+class ParseNote:
+    block_index: int
+    notes: List[str]
+
+
+@dataclass
+class NegativeAccount:
+    creditor_name: str = ""
+    masked_account_number: str = ""
+    current_balance: Optional[float] = None
+    last_reported_date: Optional[date] = None
+    date_opened: Optional[date] = None
+    age_of_account: str = ""
+    negative_type_status: str = ""
+    bureaus: str = ""
+    estimated_impact: str = ""
+    raw_block_snippet: str = ""
+
+
+def normalize_status(block_text: str) -> str:
+    t = f" { (block_text or '').lower() } "
+    for label, keys in STATUS_MAP:
+        for k in keys:
+            if k in t:
+                return label
+    # fallback: look for explicit late codes like 30/60/90/120
+    if re.search(r"\b(30|60|90|120)\b", t) and "late" in t:
+        return "Late/Delinquent"
+    return ""
+
+
+def looks_negative(block_text: str) -> bool:
+    t = (block_text or "").lower()
+    return any(k in t for k in NEG_KEYWORDS)
+
+
+def clean_creditor_name(name: str) -> str:
+    if not name:
+        return ""
+    n = re.sub(r"\s+", " ", name).strip()
+    # strip obvious label residue
+    n = re.sub(r"(?i)^(creditor|subscriber|furnisher|company|lender|collection agency|original creditor)\s*[:\-]\s*", "", n).strip()
+    # remove trailing junk if it's mostly punctuation
+    n = re.sub(r"[|•]+$", "", n).strip()
+    return n[:80]
+
+
+def extract_first_match(patterns: List[re.Pattern], text: str) -> Optional[str]:
+    for p in patterns:
+        m = p.search(text or "")
+        if m:
+            # return last capturing group usually (value)
+            return m.group(m.lastindex or 1).strip()
+    return None
+
+
+def guess_creditor_from_lines(lines: List[str]) -> str:
+    """
+    Heuristic: pick the first non-empty line that is not a label and isn't just numbers/dates.
+    """
+    for ln in lines[:8]:
+        s = ln.strip()
+        if not s:
+            continue
+        low = s.lower()
+        if any(x in low for x in ["account", "acct", "balance", "reported", "opened", "status", "remarks", "payment", "limit", "high credit"]):
+            continue
+        # skip lines that look like just money/date/number soup
+        if re.fullmatch(r"[\d\W]+", s):
+            continue
+        # avoid super long paragraphs
+        if len(s) > 90:
+            continue
+        return clean_creditor_name(s)
+    return ""
+
+
+def extract_account_fields(block: str, block_index: int, doc_bureaus: List[str]) -> Tuple[NegativeAccount, ParseNote]:
+    notes = []
+
+    raw = (block or "").strip()
+    lines = [l.rstrip() for l in raw.splitlines() if l.strip()]
+
+    # Creditor
+    creditor = extract_first_match(LABEL_PATTERNS["creditor"], raw)
+    if creditor:
+        creditor = clean_creditor_name(creditor)
+        notes.append("Creditor: label match")
+    else:
+        creditor = guess_creditor_from_lines(lines)
+        if creditor:
+            notes.append("Creditor: line heuristic")
         else:
-            is_neg = bool(is_neg)
+            notes.append("Creditor: not found")
 
-        out.append(
-            Tradeline(
-                creditor_name=str(r.get("creditor_name", "")).strip(),
-                account_number=str(r.get("account_number", "")).strip(),
-                balance=coerce_float(r.get("balance", None)),
-                credit_limit=coerce_float(r.get("credit_limit", None)),
-                last_reported=str(r.get("last_reported", "")).strip(),
-                opened_date=str(r.get("opened_date", "")).strip(),
-                status=status,
-                bureaus=str(r.get("bureaus", "Unknown")).strip() or "Unknown",
-                account_type=str(r.get("account_type", "unknown")).strip().lower() or "unknown",
-                is_negative=is_neg,
-                notes=str(r.get("notes", "")).strip(),
-            )
-        )
-    return out
+    # Account number
+    acct_raw = extract_first_match(LABEL_PATTERNS["account"], raw)
+    if acct_raw:
+        notes.append("Account#: label match")
+    else:
+        # fallback: find any long account-like token
+        m = ACCT_LIKE_RE.search(raw)
+        acct_raw = m.group(0).strip() if m else ""
+        if acct_raw:
+            notes.append("Account#: token heuristic")
+        else:
+            notes.append("Account#: not found")
+
+    masked_acct = mask_account_number(acct_raw)
+
+    # Balance
+    bal_raw = extract_first_match(LABEL_PATTERNS["balance"], raw)
+    bal = None
+    if bal_raw:
+        bal = parse_money(bal_raw)
+        notes.append("Balance: label match")
+    else:
+        # fallback: try first money value near word "balance" or "owed"
+        nearby = ""
+        m = re.search(r"(?i)\b(balance|amount\s*owed|current\s*balance)\b(.{0,60})", raw)
+        if m:
+            nearby = m.group(0)
+            bal = parse_money(nearby)
+        if bal is not None:
+            notes.append("Balance: nearby heuristic")
+        else:
+            notes.append("Balance: not found")
+
+    # Dates
+    last_raw = extract_first_match(LABEL_PATTERNS["last_reported"], raw)
+    opened_raw = extract_first_match(LABEL_PATTERNS["opened"], raw)
+
+    last_dt = parse_date_from_text(last_raw or "")
+    if last_dt:
+        notes.append("Last reported: label match")
+    else:
+        # fallback: search for a date near 'reported' / 'updated'
+        m = re.search(r"(?i)\b(reported|updated)\b(.{0,60})", raw)
+        last_dt = parse_date_from_text(m.group(0)) if m else None
+        notes.append("Last reported: fallback search" if last_dt else "Last reported: not found")
+
+    opened_dt = parse_date_from_text(opened_raw or "")
+    if opened_dt:
+        notes.append("Opened: label match")
+    else:
+        m = re.search(r"(?i)\b(opened|date\s*opened|open\s*date)\b(.{0,60})", raw)
+        opened_dt = parse_date_from_text(m.group(0)) if m else None
+        notes.append("Opened: fallback search" if opened_dt else "Opened: not found")
+
+    # Status / Negative type
+    status_raw = extract_first_match(LABEL_PATTERNS["status"], raw)
+    if status_raw:
+        notes.append("Status: label match")
+    status = normalize_status(raw if not status_raw else f"{raw}\n{status_raw}")
+    if status:
+        notes.append(f"Negative type: {status}")
+    else:
+        notes.append("Negative type: not found")
+
+    bureaus = detect_bureau_for_block(raw, doc_bureaus)
+
+    acct = NegativeAccount(
+        creditor_name=creditor,
+        masked_account_number=masked_acct,
+        current_balance=bal,
+        last_reported_date=last_dt,
+        date_opened=opened_dt,
+        age_of_account=calc_age(opened_dt),
+        negative_type_status=status,
+        bureaus=bureaus,
+        estimated_impact="",  # set later
+        raw_block_snippet=mask_pii_in_snippet(raw[:1400]),
+    )
+    return acct, ParseNote(block_index=block_index, notes=notes)
 
 
-# =============================================================================
-# PDF Extraction
-# =============================================================================
-def extract_text_pymupdf(pdf_bytes: bytes) -> Tuple[str, Dict]:
-    meta = {"engine": "PyMuPDF", "pages": 0, "mode": "Text", "ms": 0}
-    t0 = time.time()
+def build_blocks_from_text(full_text: str) -> List[str]:
+    """
+    Block detection:
+    1) Split by double newlines as rough paragraphs.
+    2) If paragraphs are too large or too few, fall back to sliding-window blocks around negative keyword lines.
+    """
+    t = (full_text or "").replace("\r\n", "\n")
+    paras = [p.strip() for p in re.split(r"\n\s*\n+", t) if p.strip()]
+
+    # If we got a reasonable number of paragraphs, keep them.
+    if 8 <= len(paras) <= 400:
+        return paras
+
+    # Otherwise: line-based windows around negative hits
+    lines = [ln for ln in t.splitlines()]
+    hit_idxs = []
+    for i, ln in enumerate(lines):
+        low = ln.lower()
+        if any(k in low for k in NEG_KEYWORDS):
+            hit_idxs.append(i)
+
+    windows = []
+    for idx in hit_idxs:
+        start = max(0, idx - 8)
+        end = min(len(lines), idx + 10)
+        windows.append((start, end))
+
+    # merge overlaps
+    windows.sort()
+    merged = []
+    for s, e in windows:
+        if not merged or s > merged[-1][1]:
+            merged.append([s, e])
+        else:
+            merged[-1][1] = max(merged[-1][1], e)
+
+    blocks = []
+    for s, e in merged:
+        blk = "\n".join(lines[s:e]).strip()
+        if blk:
+            blocks.append(blk)
+
+    # Final fallback: whole text
+    return blocks if blocks else [t.strip()]
+
+
+# -----------------------------
+# Extraction pipeline: Text then OCR
+# -----------------------------
+def extract_text_pymupdf(pdf_bytes: bytes) -> str:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    meta["pages"] = doc.page_count
     parts = []
-    for i in range(doc.page_count):
-        page = doc.load_page(i)
+    for page in doc:
         parts.append(page.get_text("text") or "")
-    meta["ms"] = int((time.time() - t0) * 1000)
-    return normalize_whitespace("\n".join(parts)), meta
+    doc.close()
+    return "\n".join(parts).strip()
 
 
-def extract_text_pdfplumber(pdf_bytes: bytes) -> Tuple[str, Dict]:
-    meta = {"engine": "pdfplumber", "pages": 0, "mode": "Text", "ms": 0}
-    t0 = time.time()
-    parts = []
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        meta["pages"] = len(pdf.pages)
-        for p in pdf.pages:
-            parts.append(p.extract_text() or "")
-    meta["ms"] = int((time.time() - t0) * 1000)
-    return normalize_whitespace("\n".join(parts)), meta
-
-
-def ocr_pdf_pymupdf(pdf_bytes: bytes, max_pages: int = MAX_PAGES_OCR) -> Tuple[str, Dict]:
-    meta = {"engine": "PyMuPDF+Tesseract", "pages": 0, "mode": "OCR", "ms": 0, "pages_ocr": 0}
-    t0 = time.time()
+def extract_text_ocr(pdf_bytes: bytes, dpi: int = 220) -> str:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    meta["pages"] = doc.page_count
-    pages_to_ocr = min(doc.page_count, max_pages)
-    meta["pages_ocr"] = pages_to_ocr
-
     parts = []
-    matrix = fitz.Matrix(OCR_RENDER_SCALE, OCR_RENDER_SCALE)
-    for i in range(pages_to_ocr):
-        page = doc.load_page(i)
-        pix = page.get_pixmap(matrix=matrix, alpha=False)
+    zoom = dpi / 72.0  # 72 dpi base
+    mat = fitz.Matrix(zoom, zoom)
+
+    for i, page in enumerate(doc):
+        pix = page.get_pixmap(matrix=mat, alpha=False)
         img = Image.open(io.BytesIO(pix.tobytes("png")))
         txt = pytesseract.image_to_string(img)
         parts.append(txt or "")
-    meta["ms"] = int((time.time() - t0) * 1000)
-    return normalize_whitespace("\n".join(parts)), meta
+
+    doc.close()
+    return "\n".join(parts).strip()
 
 
-def should_fallback_to_ocr(text: str) -> bool:
-    if len(text) < 1200:
+def compute_confidence(extracted_text: str, accounts: List[NegativeAccount]) -> Tuple[str, Dict[str, float]]:
+    """
+    Confidence based on:
+    - text length
+    - field completion rate for key fields
+    """
+    tlen = len((extracted_text or "").strip())
+    n = max(1, len(accounts))
+
+    def filled(v) -> bool:
+        if v is None:
+            return False
+        if isinstance(v, str):
+            return bool(v.strip())
         return True
-    digits = sum(ch.isdigit() for ch in text)
-    if digits < 120:
-        return True
-    return False
 
+    key_fields = ["creditor_name", "masked_account_number", "current_balance", "negative_type_status", "last_reported_date"]
+    filled_counts = {k: 0 for k in key_fields}
 
-def compute_field_completion(lines: List[Tradeline]) -> float:
-    if not lines:
-        return 0.0
-    fields = ["creditor_name", "account_number", "balance", "last_reported", "status"]
-    total = len(lines) * len(fields)
-    filled = 0.0
-    for tl in lines:
-        filled += 1 if tl.creditor_name else 0
-        filled += 1 if tl.account_number else 0
-        filled += 1 if tl.balance is not None else 0
-        filled += 1 if tl.last_reported else 0
-        filled += 1 if tl.status else 0
-    return min(1.0, filled / total)
+    for a in accounts:
+        for k in key_fields:
+            v = getattr(a, k)
+            filled_counts[k] += 1 if filled(v) else 0
 
+    completion = sum(filled_counts[k] / n for k in key_fields) / len(key_fields)
 
-def extraction_quality(text: str, completion: float) -> Tuple[str, str]:
-    L = len(text)
-    if L > 9000 and completion >= 0.70:
-        return "High", "Strong text volume + good field completion."
-    if L > 3500 and completion >= 0.45:
-        return "Medium", "Decent extraction; some fields may need Manual Fix."
-    return "Low", "Sparse text or low field completion. Expect Manual Fix and/or OCR."
+    # length score
+    if tlen >= 12000:
+        len_score = 1.0
+    elif tlen >= 5000:
+        len_score = 0.7
+    elif tlen >= 2000:
+        len_score = 0.45
+    else:
+        len_score = 0.25
 
+    score = 0.55 * completion + 0.45 * len_score
 
-# =============================================================================
-# Parsing
-# =============================================================================
-def parse_tradelines(text: str, bureaus: List[str]) -> Tuple[List[Tradeline], Dict]:
-    blocks = split_into_tradeline_blocks(text)
-    parsed: List[Tradeline] = []
-
-    for b in blocks:
-        status, matched_statuses = classify_status(b)
-        acct = pick_account_number(b)
-        creditor = pick_creditor_name(b)
-        bal = pick_balance(b)
-        last_rep = pick_last_reported_date(b)
-
-        opened = ""
-        mo = re.search(r"(opened|date\s+opened)\s*[:\-]?\s*(.*)$", b, flags=re.IGNORECASE)
-        if mo:
-            opened_candidates = extract_dates(mo.group(0))
-            if opened_candidates:
-                opened = opened_candidates[0]
-
-        acc_type = guess_account_type(b)
-
-        tl = Tradeline(
-            creditor_name=creditor,
-            account_number=acct,
-            balance=bal,
-            credit_limit=None,
-            last_reported=last_rep,
-            opened_date=opened,
-            status=status,
-            bureaus=", ".join(bureaus) if bureaus else "Unknown",
-            account_type=acc_type,
-            is_negative=(status != "ok"),
-            notes=";".join(matched_statuses) if matched_statuses else "",
-        )
-
-        signal = 0
-        signal += 1 if tl.creditor_name and len(tl.creditor_name) >= 4 else 0
-        signal += 1 if tl.account_number else 0
-        signal += 1 if tl.balance is not None else 0
-        signal += 1 if tl.last_reported else 0
-
-        if signal >= 2:
-            parsed.append(tl)
-
-    # de-dupe
-    uniq = []
-    seen = set()
-    for tl in parsed:
-        k = (tl.creditor_name.lower().strip(), mask_account_number(tl.account_number), tl.status)
-        if k in seen:
-            continue
-        seen.add(k)
-        uniq.append(tl)
+    if score >= 0.78:
+        label = "High"
+    elif score >= 0.55:
+        label = "Medium"
+    else:
+        label = "Low"
 
     debug = {
-        "blocks_count": len(blocks),
-        "parsed_count": len(uniq),
-        "raw_blocks_preview": blocks[:8],
+        "text_length": float(tlen),
+        "completion_rate": float(completion),
+        "score": float(score),
     }
-    return uniq, debug
+    return label, debug
 
 
-# =============================================================================
-# Recommendations + Scoring
-# =============================================================================
-def recommend_actions(tl: Tradeline) -> List[Dict]:
-    actions = []
-    bal = 0.0 if tl.balance is None else float(tl.balance)
+# -----------------------------
+# Impact estimator (heuristics)
+# -----------------------------
+def impact_range_for_account(
+    neg_type: str,
+    last_reported: Optional[date],
+    balance: Optional[float],
+) -> Tuple[str, str]:
+    """
+    Returns: (tier_label, range_str)
+    - No exact scores. Realistic ranges.
+    - Uses type + recency + balance severity.
+    """
+    t = (neg_type or "").lower()
+    bal = balance or 0.0
 
-    if tl.status == "collection":
-        actions.append({"action": "Pay-for-Delete (PFD) negotiation",
-                        "why": "Collections often suppress scores; deletion is usually better than just paid.",
-                        "impact": (15, 60), "effort": "Medium"})
-        actions.append({"action": "Dispute inaccuracies with bureaus (if truly inaccurate)",
-                        "why": "Incorrect dates/amounts/ownership can lead to removal/correction.",
-                        "impact": (10, 50), "effort": "Medium"})
-        actions.append({"action": "Pay/settle to $0 (if deletion not possible)",
-                        "why": "Can help underwriting optics; some models benefit modestly.",
-                        "impact": (0, 25), "effort": "Low"})
-
-    elif tl.status == "charge_off":
-        actions.append({"action": "Settle/pay and ensure bureaus update to $0 balance",
-                        "why": "May improve underwriting and sometimes modest score gains.",
-                        "impact": (0, 25), "effort": "Medium"})
-        actions.append({"action": "Dispute factual inaccuracies (carefully)",
-                        "why": "If reporting is wrong, correction/removal can improve score.",
-                        "impact": (10, 50), "effort": "Medium"})
-        actions.append({"action": "Goodwill request (if applicable)",
-                        "why": "Sometimes lenders remove late notations for good history.",
-                        "impact": (0, 20), "effort": "Low"})
-
-    elif tl.status == "late":
-        actions.append({"action": "Goodwill adjustment request",
-                        "why": "If isolated and you’re current, some lenders remove late marks.",
-                        "impact": (5, 35), "effort": "Low"})
-        actions.append({"action": "Bring current / autopay + document hardship if applicable",
-                        "why": "Preventing new lates stabilizes scores fastest.",
-                        "impact": (0, 15), "effort": "Low"})
-        actions.append({"action": "Dispute inaccuracies (only if truly inaccurate)",
-                        "why": "Incorrect late reporting can be corrected/removed.",
-                        "impact": (10, 40), "effort": "Medium"})
-
-    elif tl.status in ["bankruptcy", "foreclosure", "judgment", "repossession"]:
-        actions.append({"action": "Verify dates/public-record matching; dispute inaccuracies",
-                        "why": "Hard to remove unless inaccurate; corrections can help.",
-                        "impact": (10, 40), "effort": "Medium"})
-        actions.append({"action": "Focus on utilization + adding positives",
-                        "why": "Major derogs: gains often come from utilization and positive history.",
-                        "impact": (10, 50), "effort": "Low"})
-
-    else:
-        if tl.account_type == "revolving" and bal > 0:
-            actions.append({"action": "Utilization paydown strategy (30% → 10% → 1–9%)",
-                            "why": "Utilization is one of the fastest-moving factors.",
-                            "impact": (10, 70), "effort": "Low"})
-
-    effort_rank = {"Low": 0, "Medium": 1, "High": 2}
-    actions.sort(key=lambda a: (a["impact"][1], -effort_rank.get(a["effort"], 1)), reverse=True)
-    return actions[:5]
-
-
-def summarize_negatives(lines: List[Tradeline]) -> Dict[str, int]:
-    c = {"collections": 0, "charge_offs": 0, "lates": 0, "major": 0}
-    for tl in lines:
-        if tl.status == "collection":
-            c["collections"] += 1
-        elif tl.status == "charge_off":
-            c["charge_offs"] += 1
-        elif tl.status == "late":
-            c["lates"] += 1
-        elif tl.status in ["bankruptcy", "foreclosure", "judgment", "repossession"]:
-            c["major"] += 1
-    return c
-
-
-def clamp(x, lo, hi):
-    return max(lo, min(hi, x))
-
-
-def baseline_score_range(lines: List[Tradeline], user_known_score: Optional[int]) -> Tuple[int, int, Dict]:
-    neg = summarize_negatives(lines)
-    total_negs = neg["collections"] + neg["charge_offs"] + neg["lates"] + neg["major"]
-    info = {"method": "", "negatives": neg}
-
-    if user_known_score is not None:
-        lo = clamp(user_known_score - 25, 300, 850)
-        hi = clamp(user_known_score + 25, 300, 850)
-        info["method"] = "User provided"
-        return int(lo), int(hi), info
-
-    center = 690
-    center -= neg["collections"] * 35
-    center -= neg["charge_offs"] * 30
-    center -= neg["lates"] * 18
-    center -= neg["major"] * 45
-
-    width = 60 + total_negs * 10
-    lo = clamp(center - width, 300, 850)
-    hi = clamp(center + width, 300, 850)
-    info["method"] = "Inferred"
-    return int(lo), int(hi), info
-
-
-def combined_scenario_adjustment(current_lo: int, current_hi: int, toggles: Dict) -> Tuple[int, int, Dict]:
-    potentials = []
-    util_target = int(toggles.get("util_target", 30))
-
-    if util_target <= 9:
-        potentials.append(("utilization_1_9", 20, 80))
-    elif util_target <= 10:
-        potentials.append(("utilization_10", 15, 60))
-    elif util_target <= 30:
-        potentials.append(("utilization_30", 5, 35))
-
-    if toggles.get("remove_collections", False):
-        potentials.append(("remove_collections", 15, 70))
-    if toggles.get("remove_chargeoffs", False):
-        potentials.append(("remove_chargeoffs", 5, 45))
-    if toggles.get("remove_lates", False):
-        potentials.append(("remove_lates", 10, 55))
-    if toggles.get("add_authorized_user", False):
-        potentials.append(("authorized_user", 5, 35))
-    if toggles.get("add_new_revolver", False):
-        potentials.append(("new_revolver", 3, 25))
-
-    months = int(toggles.get("months_pass", 0))
-    if months > 0:
-        potentials.append(("time", 0, min(30, 2 * months)))
-
-    n = len(potentials)
-    if n == 0:
-        return current_lo, current_hi, {"potentials": [], "compression": 1.0}
-
-    sum_lo = sum(p[1] for p in potentials)
-    sum_hi = sum(p[2] for p in potentials)
-
-    compression = {1: 1.0, 2: 0.85, 3: 0.75, 4: 0.68}.get(n, 0.62)
-    gain_lo = int(round(sum_lo * compression))
-    gain_hi = int(round(sum_hi * compression))
-
-    new_lo = clamp(current_lo + gain_lo, 300, 850)
-    new_hi = clamp(current_hi + gain_hi, 300, 850)
-    return int(new_lo), int(new_hi), {"potentials": potentials, "compression": compression}
-
-
-def utilization_paydown_helper(total_balance: float, total_limit: float) -> Dict[str, float]:
-    out = {}
-    for target in [30, 10, 9]:
-        target_bal = (target / 100.0) * total_limit
-        out[f"to_{target}%"] = round(max(0.0, total_balance - target_bal), 2)
-    target = 5
-    out["to_1_9%_mid(5%)"] = round(max(0.0, total_balance - (target / 100.0) * total_limit), 2)
-    return out
-
-
-def build_checklist_pdf_bytes(score_lo: int, score_hi: int, goal_score: int, top_actions: List[str], negative_lines: List[Tradeline]) -> bytes:
-    buffer = io.BytesIO()
-    c = canvas.Canvas(buffer, pagesize=LETTER)
-    w, h = LETTER
-
-    def draw_header(title: str):
-        c.setFont("Helvetica-Bold", 16)
-        c.drawString(0.75 * inch, h - 0.9 * inch, title)
-        c.setFont("Helvetica", 9)
-        c.drawRightString(w - 0.75 * inch, h - 0.85 * inch, f"Generated: {now_str()}")
-
-    def draw_wrapped(text: str, x: float, y: float, max_width: float, line_height: float = 12, font="Helvetica", size=10):
-        c.setFont(font, size)
-        words = text.split()
-        line = ""
-        yy = y
-        for word in words:
-            test = (line + " " + word).strip()
-            if c.stringWidth(test, font, size) <= max_width:
-                line = test
-            else:
-                c.drawString(x, yy, line)
-                yy -= line_height
-                line = word
-        if line:
-            c.drawString(x, yy, line)
-            yy -= line_height
-        return yy
-
-    draw_header("Rapid Rescore Checklist")
-    y = h - 1.35 * inch
-    c.setFont("Helvetica", 11)
-    c.drawString(0.75 * inch, y, f"Estimated current score range: {score_lo}–{score_hi}")
-    y -= 16
-    c.drawString(0.75 * inch, y, f"Selected goal score: {goal_score}")
-    y -= 18
-
-    c.setFont("Helvetica-Bold", 12)
-    c.drawString(0.75 * inch, y, "Top recommended actions (overall):")
-    y -= 14
-
-    c.setFont("Helvetica", 10)
-    for i, a in enumerate(top_actions[:6], start=1):
-        y = draw_wrapped(f"{i}. {a}", 0.9 * inch, y, max_width=w - 1.6 * inch, line_height=12, size=10)
-        y -= 2
-
-    y -= 8
-    c.setFont("Helvetica-Oblique", 9)
-    y = draw_wrapped(
-        "Disclaimer: Score outcomes are estimates and not guaranteed. Actual results vary by bureau, model, timing, "
-        "reporting practices, and credit file characteristics.",
-        0.75 * inch, y, max_width=w - 1.5 * inch, line_height=11, size=9
-    )
-    c.showPage()
-
-    for tl in negative_lines:
-        draw_header("Account Checklist")
-        y = h - 1.35 * inch
-
-        acct_mask = mask_account_number(tl.account_number)
-        bal_str = "—" if tl.balance is None else f"${tl.balance:,.2f}"
-
-        c.setFont("Helvetica-Bold", 12)
-        c.drawString(0.75 * inch, y, f"{tl.creditor_name} ({acct_mask})")
-        y -= 16
-
-        c.setFont("Helvetica", 10)
-        c.drawString(0.75 * inch, y, f"Status: {tl.status}")
-        y -= 14
-        c.drawString(0.75 * inch, y, f"Current balance: {bal_str}")
-        y -= 14
-        c.drawString(0.75 * inch, y, f"Last reported date: {tl.last_reported or '—'}")
-        y -= 14
-        c.drawString(0.75 * inch, y, f"Bureau(s): {tl.bureaus}")
-        y -= 18
-
-        c.setFont("Helvetica-Bold", 11)
-        c.drawString(0.75 * inch, y, "Recommended action(s):")
-        y -= 14
-
-        recs = recommend_actions(tl)
-        c.setFont("Helvetica", 10)
-        if recs:
-            for r in recs[:3]:
-                y = draw_wrapped(f"• {r['action']} — Why: {r['why']}", 0.9 * inch, y, w - 1.6 * inch, 12, "Helvetica", 10)
-                y -= 2
+    # recency buckets
+    recency = "unknown"
+    months = None
+    if last_reported:
+        months = (TODAY.year - last_reported.year) * 12 + (TODAY.month - last_reported.month)
+        if months <= 12:
+            recency = "recent"
+        elif months <= 24:
+            recency = "mid"
         else:
-            y = draw_wrapped("• Review account for potential disputes or paydown opportunities.", 0.9 * inch, y, w - 1.6 * inch, 12, "Helvetica", 10)
+            recency = "old"
 
-        y -= 10
-        c.setFont("Helvetica-Bold", 11)
-        c.drawString(0.75 * inch, y, "Documents to collect:")
-        y -= 14
+    # balance severity
+    if bal >= 10000:
+        bsev = "high"
+    elif bal >= 2000:
+        bsev = "med"
+    else:
+        bsev = "low"
 
-        docs = [
-            "Proof of payment / receipt",
-            "Settlement letter (if settling)",
-            "Updated $0 balance letter (if paid)",
-            "Most recent account statement",
-            "Identity verification (as required by bureau)",
-            "Dispute notes (what’s inaccurate, dates, amounts, ownership)",
-        ]
-        c.setFont("Helvetica", 10)
-        for d in docs:
-            c.drawString(0.9 * inch, y, f"☐ {d}")
-            y -= 12
+    # base by type
+    if "bankruptcy" in t:
+        base = (60, 180)
+        tier = "Severe"
+    elif "foreclosure" in t:
+        base = (50, 160)
+        tier = "Severe"
+    elif "judgment" in t:
+        base = (35, 110)
+        tier = "High"
+    elif "repossession" in t:
+        base = (40, 120)
+        tier = "High"
+    elif "charge-off" in t:
+        base = (25, 90)
+        tier = "High"
+    elif "collection" in t:
+        base = (15, 70)
+        tier = "Moderate"
+    elif "late (120" in t:
+        base = (20, 80)
+        tier = "High"
+    elif "late (90" in t:
+        base = (18, 70)
+        tier = "Moderate"
+    elif "late (60" in t:
+        base = (12, 45)
+        tier = "Moderate"
+    elif "late (30" in t:
+        base = (5, 25)
+        tier = "Low"
+    elif "late" in t or "delinquent" in t:
+        base = (8, 35)
+        tier = "Low–Moderate"
+    else:
+        base = (8, 35)
+        tier = "Low–Moderate"
 
-        y -= 10
-        c.setFont("Helvetica-Bold", 11)
-        c.drawString(0.75 * inch, y, "Notes / Follow-up:")
-        y -= 10
-        c.setFont("Helvetica", 10)
-        for _ in range(10):
-            c.line(0.75 * inch, y, w - 0.75 * inch, y)
-            y -= 14
+    lo, hi = base
 
-        c.showPage()
+    # adjust by recency
+    if recency == "recent":
+        lo = int(lo * 1.15)
+        hi = int(hi * 1.20)
+    elif recency == "mid":
+        lo = int(lo * 1.00)
+        hi = int(hi * 1.00)
+    elif recency == "old":
+        lo = int(lo * 0.70)
+        hi = int(hi * 0.75)
+    else:
+        lo = int(lo * 0.90)
+        hi = int(hi * 0.90)
 
-    c.save()
-    buffer.seek(0)
-    return buffer.read()
+    # adjust by balance (collections/charge-offs more sensitive to size)
+    if "collection" in t or "charge-off" in t or "repossession" in t or "judgment" in t:
+        if bsev == "high":
+            lo = int(lo * 1.15)
+            hi = int(hi * 1.20)
+        elif bsev == "med":
+            lo = int(lo * 1.05)
+            hi = int(hi * 1.08)
+        else:
+            lo = int(lo * 0.95)
+            hi = int(hi * 0.95)
 
+    # clamp sanity
+    lo = max(0, lo)
+    hi = max(lo + 5, hi)
 
-# =============================================================================
-# Session State
-# =============================================================================
-def init_state():
-    st.session_state.setdefault("pdf_hash", "")
-    st.session_state.setdefault("raw_text", "")
-    st.session_state.setdefault("extraction_meta", {})
-    st.session_state.setdefault("bureaus", ["Unknown"])
-    st.session_state.setdefault("parse_debug", {})
-    st.session_state.setdefault("tradelines_df", pd.DataFrame())
-    st.session_state.setdefault("edited_df", None)
-    st.session_state.setdefault("quality_confidence", "Low")
-    st.session_state.setdefault("quality_hint", "")
-
-init_state()
-
-
-# =============================================================================
-# UI - Header
-# =============================================================================
-st.title("📈 Mortgage Rapid Rescore / Credit Score Simulator")
-st.caption("Rapid-rescore workflow with OCR fallback, manual fixes, recommendations, what-if simulator, and checklist export.")
-st.markdown(DISCLAIMER)
-st.markdown(PRIVACY_NOTE)
-st.divider()
+    return tier, f"{lo}–{hi} pts"
 
 
-# =============================================================================
-# Sidebar
-# =============================================================================
-with st.sidebar:
-    st.header("Upload & Settings")
-    uploaded = st.file_uploader("Upload a credit bureau PDF", type=["pdf"], key="pdf_uploader")
+def overall_negative_pressure(accounts: List[NegativeAccount]) -> str:
+    """
+    Not additive. A qualitative “pressure” indicator.
+    """
+    if not accounts:
+        return "None detected"
 
-    use_known_score = st.checkbox("I know the current credit score (optional)", value=False, key="use_known_score")
-    if use_known_score:
-        user_score_val = st.number_input(
-            "Current credit score",
-            min_value=300,
-            max_value=850,
-            value=680,
-            step=1,
-            key="user_score_input",
+    # weight by type
+    w = 0.0
+    for a in accounts:
+        t = (a.negative_type_status or "").lower()
+        if "bankruptcy" in t or "foreclosure" in t:
+            w += 3.5
+        elif "repossession" in t or "judgment" in t:
+            w += 2.8
+        elif "charge-off" in t:
+            w += 2.3
+        elif "collection" in t:
+            w += 1.6
+        elif "late (120" in t:
+            w += 1.9
+        elif "late (90" in t:
+            w += 1.5
+        elif "late (60" in t:
+            w += 1.1
+        elif "late (30" in t:
+            w += 0.7
+        elif "late" in t or "delinquent" in t:
+            w += 0.8
+        else:
+            w += 0.6
+
+        # small bump for large balances
+        bal = a.current_balance or 0.0
+        if bal >= 10000:
+            w += 0.5
+        elif bal >= 2000:
+            w += 0.2
+
+        # bump for recent reporting
+        if a.last_reported_date:
+            months = (TODAY.year - a.last_reported_date.year) * 12 + (TODAY.month - a.last_reported_date.month)
+            if months <= 12:
+                w += 0.4
+            elif months <= 24:
+                w += 0.2
+
+    # map weight to category
+    if w >= 12:
+        return "Very High negative pressure"
+    if w >= 7:
+        return "High negative pressure"
+    if w >= 3.5:
+        return "Moderate negative pressure"
+    return "Low negative pressure"
+
+
+# -----------------------------
+# Main parse orchestrator
+# -----------------------------
+def parse_negative_accounts(extracted_text: str) -> Tuple[List[NegativeAccount], List[str], List[str], List[ParseNote], List[str]]:
+    doc_bureaus = detect_bureau(extracted_text)
+    blocks = build_blocks_from_text(extracted_text)
+
+    negative_accounts: List[NegativeAccount] = []
+    notes: List[ParseNote] = []
+    negative_blocks: List[str] = []
+
+    for i, blk in enumerate(blocks):
+        if not looks_negative(blk):
+            continue
+
+        acct, n = extract_account_fields(blk, i, doc_bureaus)
+
+        # Keep only if we have at least a status AND a creditor or balance (avoid random matches)
+        has_minimum = bool(acct.negative_type_status) and (bool(acct.creditor_name) or (acct.current_balance is not None))
+        if not has_minimum:
+            # still store note for debug
+            notes.append(ParseNote(block_index=i, notes=n.notes + ["Result: skipped (insufficient fields)"]))
+            continue
+
+        # impact
+        tier, rng = impact_range_for_account(acct.negative_type_status, acct.last_reported_date, acct.current_balance)
+        acct.estimated_impact = f"{tier}: {rng}"
+
+        negative_accounts.append(acct)
+        negative_blocks.append(blk)
+        notes.append(n)
+
+    # dedupe accounts by (creditor, acct last4, type, balance approx)
+    deduped = []
+    seen = set()
+    for a in negative_accounts:
+        key = (
+            (a.creditor_name or "").lower().strip()[:40],
+            a.masked_account_number,
+            (a.negative_type_status or "").lower(),
+            int((a.current_balance or 0.0) // 10)  # coarse bucket
         )
-        user_score_val = int(user_score_val)
-    else:
-        user_score_val = None
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(a)
 
-    goal_score = st.selectbox("Goal score", [620, 660, 680, 700], index=3, key="goal_score")
+    debug_warnings = []
+    if not doc_bureaus:
+        debug_warnings.append("Bureau detection: none found (normal for some report formats).")
+    if len(blocks) == 1 and len(blocks[0]) > 20000:
+        debug_warnings.append("Block detection: report did not split cleanly; using fallback windowing may improve reliability on some formats.")
 
-    st.subheader("OCR Safety")
-    st.write(f"Max OCR pages: **{MAX_PAGES_OCR}**")
-    st.caption("If the PDF is scanned or text is weak, OCR runs (capped for reliability).")
-
-    run_btn = st.button("Process PDF", type="primary", use_container_width=True, key="process_pdf_button")
-
-
-# =============================================================================
-# Process PDF
-# =============================================================================
-if run_btn:
-    if not uploaded:
-        st.error("Please upload a PDF first.")
-    else:
-        pdf_bytes = uploaded.read()
-        pdf_hash = stable_hash_bytes(pdf_bytes)
-        st.session_state["pdf_hash"] = pdf_hash
-
-        # 1) PyMuPDF
-        text1, meta1 = extract_text_pymupdf(pdf_bytes)
-
-        # 2) pdfplumber (optional)
-        text2, meta2 = ("", {})
-        if len(text1) < 2000:
-            text2, meta2 = extract_text_pdfplumber(pdf_bytes)
-
-        chosen_text, chosen_meta = text1, meta1
-        if len(text2) > len(text1) * 1.15:
-            chosen_text, chosen_meta = text2, meta2
-
-        # OCR fallback
-        if should_fallback_to_ocr(chosen_text):
-            ocr_text, ocr_meta = ocr_pdf_pymupdf(pdf_bytes, max_pages=MAX_PAGES_OCR)
-            if len(ocr_text) > len(chosen_text) * 1.05:
-                chosen_text, chosen_meta = ocr_text, ocr_meta
-
-        st.session_state["raw_text"] = chosen_text
-        st.session_state["extraction_meta"] = chosen_meta
-        st.session_state["bureaus"] = detect_bureaus(chosen_text)
-
-        # Parse tradelines
-        tradelines, dbg = parse_tradelines(chosen_text, st.session_state["bureaus"])
-        st.session_state["parse_debug"] = dbg
-
-        df = tradelines_to_df(tradelines)
-
-        # Ensure editor-friendly columns exist
-        for col, default in [
-            ("credit_limit", None),
-            ("is_negative", False),
-        ]:
-            if col not in df.columns:
-                df[col] = default
-
-        # Quality indicator
-        completion = compute_field_completion(tradelines)
-        conf, hint = extraction_quality(chosen_text, completion)
-        st.session_state["quality_confidence"] = conf
-        st.session_state["quality_hint"] = hint
-
-        st.session_state["tradelines_df"] = df
-        st.session_state["edited_df"] = None
-
-        st.success(f"Processed PDF ({pdf_hash}). Extraction: **{chosen_meta.get('mode','Text')}** via **{chosen_meta.get('engine','')}**.")
+    return deduped, doc_bureaus, blocks, notes, debug_warnings
 
 
-# =============================================================================
-# Working DF
-# =============================================================================
-base_df = st.session_state["tradelines_df"].copy()
-working_df = st.session_state["edited_df"] if st.session_state["edited_df"] is not None else base_df
-if working_df is None:
-    working_df = pd.DataFrame()
-if not isinstance(working_df, pd.DataFrame):
-    working_df = pd.DataFrame(working_df)
+# -----------------------------
+# PDF export (ReportLab)
+# -----------------------------
+def build_export_pdf(df: pd.DataFrame, extraction_mode: str, confidence: str, overall_pressure: str) -> bytes:
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=letter, rightMargin=36, leftMargin=36, topMargin=36, bottomMargin=36)
+    styles = getSampleStyleSheet()
+    story = []
 
-if working_df.empty:
-    st.info("Upload a credit bureau PDF and click **Process PDF** to begin.")
+    story.append(Paragraph("Negative Accounts Summary", styles["Title"]))
+    story.append(Spacer(1, 0.15 * inch))
+
+    meta = f"Extraction Mode: {extraction_mode} &nbsp;&nbsp;|&nbsp;&nbsp; Confidence: {confidence} &nbsp;&nbsp;|&nbsp;&nbsp; Overall Negative Pressure: {overall_pressure}"
+    story.append(Paragraph(meta, styles["Normal"]))
+    story.append(Spacer(1, 0.20 * inch))
+
+    disclaimer = (
+        "Disclaimer: This report is an informational extraction from the uploaded credit bureau PDF. "
+        "Estimated impact ranges are heuristic, not an exact score change, and vary by scoring model (e.g., FICO vs Vantage), "
+        "credit file thickness, overall utilization, and reporting details. Always verify against the source report and/or a qualified professional."
+    )
+    story.append(Paragraph(disclaimer, styles["Italic"]))
+    story.append(Spacer(1, 0.25 * inch))
+
+    if df.empty:
+        story.append(Paragraph("No negative accounts detected.", styles["Normal"]))
+        doc.build(story)
+        return buffer.getvalue()
+
+    cols = [
+        "Creditor",
+        "Acct (Last 4)",
+        "Balance",
+        "Last Reported",
+        "Opened",
+        "Age",
+        "Negative Type/Status",
+        "Bureau(s)",
+        "Estimated Impact",
+    ]
+    table_data = [cols]
+
+    def safe(v):
+        return "" if v is None else str(v)
+
+    for _, r in df.iterrows():
+        table_data.append([
+            safe(r.get("Creditor")),
+            safe(r.get("Acct (Last 4)")),
+            safe(r.get("Balance")),
+            safe(r.get("Last Reported")),
+            safe(r.get("Opened")),
+            safe(r.get("Age")),
+            safe(r.get("Negative Type/Status")),
+            safe(r.get("Bureau(s)")),
+            safe(r.get("Estimated Impact")),
+        ])
+
+    tbl = Table(table_data, repeatRows=1)
+    tbl.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.black),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, 0), 9),
+        ("FONTSIZE", (0, 1), (-1, -1), 8),
+        ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.whitesmoke, colors.lightgrey]),
+        ("LEFTPADDING", (0, 0), (-1, -1), 4),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+        ("TOPPADDING", (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+    ]))
+    story.append(tbl)
+
+    doc.build(story)
+    return buffer.getvalue()
+
+
+# -----------------------------
+# UI / State
+# -----------------------------
+def to_table_df(accounts: List[NegativeAccount]) -> pd.DataFrame:
+    rows = []
+    for a in accounts:
+        rows.append({
+            "Creditor": a.creditor_name,
+            "Acct (Last 4)": a.masked_account_number,
+            "Balance": format_money(a.current_balance),
+            "Last Reported": format_date(a.last_reported_date),
+            "Opened": format_date(a.date_opened),
+            "Age": a.age_of_account,
+            "Negative Type/Status": a.negative_type_status,
+            "Bureau(s)": a.bureaus,
+            "Estimated Impact": a.estimated_impact,
+        })
+    return pd.DataFrame(rows)
+
+
+def build_manual_editor_df(accounts: List[NegativeAccount]) -> pd.DataFrame:
+    """
+    Editable fields (no full PII):
+      - Creditor, Acct last4, balance, dates, status, bureaus
+    """
+    rows = []
+    for idx, a in enumerate(accounts):
+        rows.append({
+            "RowID": idx,
+            "Creditor": a.creditor_name,
+            "Acct (Last 4)": a.masked_account_number,
+            "Balance (number)": float(a.current_balance) if a.current_balance is not None else None,
+            "Last Reported (YYYY-MM-DD)": format_date(a.last_reported_date),
+            "Opened (YYYY-MM-DD)": format_date(a.date_opened),
+            "Negative Type/Status": a.negative_type_status,
+            "Bureau(s)": a.bureaus,
+        })
+    return pd.DataFrame(rows)
+
+
+def apply_manual_overrides(base_accounts: List[NegativeAccount], edited_df: pd.DataFrame) -> List[NegativeAccount]:
+    updated = []
+    by_id = {int(r["RowID"]): r for _, r in edited_df.iterrows() if pd.notnull(r.get("RowID"))}
+
+    for i, a in enumerate(base_accounts):
+        r = by_id.get(i)
+        if r is None:
+            updated.append(a)
+            continue
+
+        creditor = str(r.get("Creditor") or "").strip()
+        acct_last4 = str(r.get("Acct (Last 4)") or "").strip()
+        bal_num = r.get("Balance (number)")
+        last_s = str(r.get("Last Reported (YYYY-MM-DD)") or "").strip()
+        open_s = str(r.get("Opened (YYYY-MM-DD)") or "").strip()
+        status = str(r.get("Negative Type/Status") or "").strip()
+        bureaus = str(r.get("Bureau(s)") or "").strip()
+
+        # parse dates if provided
+        last_dt = None
+        if last_s:
+            try:
+                last_dt = datetime.strptime(last_s, "%Y-%m-%d").date()
+            except ValueError:
+                last_dt = parse_date_from_text(last_s)
+
+        open_dt = None
+        if open_s:
+            try:
+                open_dt = datetime.strptime(open_s, "%Y-%m-%d").date()
+            except ValueError:
+                open_dt = parse_date_from_text(open_s)
+
+        bal = None
+        try:
+            if bal_num is not None and not (isinstance(bal_num, float) and math.isnan(bal_num)):
+                bal = float(bal_num)
+        except Exception:
+            bal = None
+
+        # impact re-estimate
+        tier, rng = impact_range_for_account(status, last_dt, bal)
+        est = f"{tier}: {rng}" if status else ""
+
+        updated.append(NegativeAccount(
+            creditor_name=creditor,
+            masked_account_number=acct_last4 if acct_last4 else a.masked_account_number,
+            current_balance=bal,
+            last_reported_date=last_dt,
+            date_opened=open_dt,
+            age_of_account=calc_age(open_dt),
+            negative_type_status=status,
+            bureaus=bureaus,
+            estimated_impact=est,
+            raw_block_snippet=a.raw_block_snippet,  # keep original snippet
+        ))
+    return updated
+
+
+# -----------------------------
+# Header
+# -----------------------------
+st.title("📄 Negative Accounts Extractor (PDF → Structured Table)")
+st.caption("Uploads are processed in-memory only. Account numbers are masked by default. OCR fallback enabled for scanned PDFs.")
+
+
+uploaded = st.file_uploader("Upload a credit bureau PDF", type=["pdf"])
+
+if "state" not in st.session_state:
+    st.session_state.state = {}
+
+state = st.session_state.state
+
+if uploaded is None:
+    st.info("Upload a PDF to begin.")
     st.stop()
 
-
-# =============================================================================
-# Compute score range + metrics (must happen BEFORE metrics UI)
-# =============================================================================
-tls_for_score = df_to_tradelines(working_df)
-score_lo, score_hi, score_info = baseline_score_range(tls_for_score, user_score_val)
-
-collections_ct = int((working_df["status"].astype(str).str.lower() == "collection").sum()) if "status" in working_df.columns else 0
-chargeoffs_ct = int((working_df["status"].astype(str).str.lower() == "charge_off").sum()) if "status" in working_df.columns else 0
-lates_ct = int((working_df["status"].astype(str).str.lower() == "late").sum()) if "status" in working_df.columns else 0
-
-rev_mask = working_df.get("account_type", pd.Series(["unknown"] * len(working_df))).astype(str).str.lower().eq("revolving")
-rev_bal = []
-rev_lim = []
-for _, r in working_df[rev_mask].iterrows():
-    b = coerce_float(r.get("balance", None))
-    l = coerce_float(r.get("credit_limit", None))
-    if b is not None:
-        rev_bal.append(max(0.0, b))
-    if l is not None:
-        rev_lim.append(max(0.0, l))
-total_rev_bal = float(sum(rev_bal)) if rev_bal else 0.0
-total_rev_lim = float(sum(rev_lim)) if rev_lim else 0.0
-util_pct = (total_rev_bal / total_rev_lim * 100.0) if total_rev_lim > 0 else None
-
-mode = st.session_state["extraction_meta"].get("mode", "Text")
-engine = st.session_state["extraction_meta"].get("engine", "")
-conf = st.session_state.get("quality_confidence", "Low")
-hint = st.session_state.get("quality_hint", "")
-
-m1, m2, m3, m4, m5, m6 = st.columns(6)
-m1.metric("Estimated Score Range", f"{score_lo}–{score_hi}", f"Method: {score_info.get('method','')}")
-m2.metric("Collections", f"{collections_ct}")
-m3.metric("Charge-offs", f"{chargeoffs_ct}")
-m4.metric("Lates", f"{lates_ct}")
-m5.metric("Extraction Mode", f"{mode}", f"{engine}")
-m6.metric("Report Quality", f"{conf}", hint)
-
-st.divider()
+pdf_bytes = uploaded.getvalue()
 
 
-# =============================================================================
-# Tabs
-# =============================================================================
-tab_sim, tab_recs, tab_parsed, tab_debug = st.tabs(
-    ["What-If Simulator", "Recommendations", "Parsed Accounts", "Debug"]
+# -----------------------------
+# Extraction + Parse
+# -----------------------------
+with st.spinner("Extracting text..."):
+    text_primary = extract_text_pymupdf(pdf_bytes)
+    mode = "Text"
+    extracted_text = text_primary
+
+    # If text extraction is too thin, OCR
+    if len(text_primary.strip()) < 1200:
+        with st.spinner("Low text detected. Running OCR fallback..."):
+            extracted_text = extract_text_ocr(pdf_bytes)
+            mode = "OCR"
+
+with st.spinner("Parsing negative accounts..."):
+    accounts, doc_bureaus, blocks, parse_notes, debug_warnings = parse_negative_accounts(extracted_text)
+    confidence, conf_debug = compute_confidence(extracted_text, accounts)
+
+# Store base parse in session for manual fix/edit stability
+state["extraction_mode"] = mode
+state["confidence"] = confidence
+state["doc_bureaus"] = doc_bureaus
+state["blocks"] = blocks
+state["parse_notes"] = parse_notes
+state["conf_debug"] = conf_debug
+state["debug_warnings"] = debug_warnings
+state["base_accounts"] = accounts
+
+# Manual edit state init
+if "manual_df" not in state:
+    state["manual_df"] = build_manual_editor_df(accounts)
+
+# Apply overrides
+final_accounts = apply_manual_overrides(state["base_accounts"], state["manual_df"])
+final_df = to_table_df(final_accounts)
+
+# Metrics
+def count_type(sub: str) -> int:
+    sub = sub.lower()
+    return sum(1 for a in final_accounts if sub in (a.negative_type_status or "").lower())
+
+num_neg = len(final_accounts)
+num_col = count_type("collection")
+num_co = count_type("charge-off") + count_type("charge off")
+num_late = sum(1 for a in final_accounts if "late" in (a.negative_type_status or "").lower() or "delinquent" in (a.negative_type_status or "").lower())
+total_bal = sum((a.current_balance or 0.0) for a in final_accounts)
+overall_pressure = overall_negative_pressure(final_accounts)
+
+# -----------------------------
+# Top Metric Cards
+# -----------------------------
+c1, c2, c3, c4, c5, c6 = st.columns(6)
+c1.metric("# Negative Accounts", num_neg)
+c2.metric("# Collections", num_col)
+c3.metric("# Charge-offs", num_co)
+c4.metric("# Lates", num_late)
+c5.metric("Total Negative Balance", format_money(total_bal))
+c6.metric("Mode / Confidence", f"{mode} / {confidence}")
+
+st.markdown(
+    f"**Overall negative pressure:** {overall_pressure}  \n"
+    f"**Detected bureau(s):** {', '.join(doc_bureaus) if doc_bureaus else 'Unknown'}"
 )
 
-
-# =============================================================================
-# Parsed Accounts (Manual Fix)
-# =============================================================================
-with tab_parsed:
-    st.subheader("Parsed Accounts (Manual Fix)")
-    st.caption("Edit any field below. The simulator + recommendations update instantly from your edited values.")
-
-    editable_cols = [
-        "creditor_name",
-        "account_number",
-        "balance",
-        "credit_limit",
-        "last_reported",
-        "opened_date",
-        "status",
-        "bureaus",
-        "account_type",
-        "is_negative",
-        "notes",
-    ]
-    for c in editable_cols:
-        if c not in working_df.columns:
-            working_df[c] = "" if c not in ("balance", "credit_limit", "is_negative") else (False if c == "is_negative" else None)
-
-    edited = st.data_editor(
-        working_df[editable_cols].copy(),
-        use_container_width=True,
-        num_rows="dynamic",
-        column_config={
-            "balance": st.column_config.NumberColumn(format="%.2f"),
-            "credit_limit": st.column_config.NumberColumn(format="%.2f", help="Optional. Helps utilization calculations."),
-            "status": st.column_config.SelectboxColumn(
-                options=["ok", "collection", "charge_off", "late", "repossession", "bankruptcy", "foreclosure", "judgment"],
-                help="Set the correct status for best recommendations."
-            ),
-            "account_type": st.column_config.SelectboxColumn(
-                options=["unknown", "revolving", "installment"],
-                help="Set to 'revolving' for credit cards so utilization math works."
-            ),
-            "is_negative": st.column_config.CheckboxColumn(help="Mark if this account should be treated as negative."),
-        },
-        key="parsed_accounts_editor",
+with st.expander("How the impact ranges work (important)"):
+    st.write(
+        "Impact is shown as a **range** (never an exact score). It’s based on **negative type**, "
+        "**how recently it reported**, and **balance size**. Real impact varies by scoring model "
+        "(FICO vs Vantage), credit file thickness, utilization, and what else is on the report."
     )
 
-    st.session_state["edited_df"] = edited.copy()
-    st.success("Manual Fix saved in session (refresh resets unless you re-upload).")
+# -----------------------------
+# Tabs
+# -----------------------------
+tab1, tab2, tab3 = st.tabs(["Negative Accounts", "Manual Fix", "Debug"])
 
-
-# =============================================================================
-# Recommendations
-# =============================================================================
-with tab_recs:
-    st.subheader("Recommendations & Rapid Rescore Plan")
-
-    df_work = st.session_state["edited_df"] if st.session_state["edited_df"] is not None else base_df
-    if not isinstance(df_work, pd.DataFrame):
-        df_work = pd.DataFrame(df_work)
-    df_work = df_work.copy()
-
-    if "status" not in df_work.columns:
-        df_work["status"] = "ok"
-    if "is_negative" not in df_work.columns:
-        df_work["is_negative"] = df_work["status"].astype(str).str.lower().ne("ok")
-
-    neg_df = df_work[df_work["is_negative"] == True].copy()
-    if "account_number" in neg_df.columns:
-        neg_df["account_last4"] = neg_df["account_number"].astype(str).apply(mask_account_number)
-
-    if neg_df.empty:
-        st.info("No negative accounts flagged. If something is negative but parsed as OK, edit it under **Parsed Accounts**.")
+with tab1:
+    st.subheader("Negative Accounts")
+    if final_df.empty:
+        st.warning("No negative accounts detected with the current parsing rules.")
     else:
-        st.markdown("### Bad Accounts")
-        bad_cols = ["creditor_name", "account_last4", "balance", "last_reported", "status", "bureaus"]
-        existing = [c for c in bad_cols if c in neg_df.columns]
-        st.dataframe(neg_df[existing].copy(), use_container_width=True, hide_index=True)
+        st.dataframe(final_df, use_container_width=True, hide_index=True)
 
-        st.markdown("### Account-by-account actions")
-        for idx, row in neg_df.iterrows():
-            tl = Tradeline(
-                creditor_name=str(row.get("creditor_name", "")),
-                account_number=str(row.get("account_number", "")),
-                balance=coerce_float(row.get("balance", None)),
-                credit_limit=coerce_float(row.get("credit_limit", None)),
-                last_reported=str(row.get("last_reported", "")),
-                opened_date=str(row.get("opened_date", "")),
-                status=str(row.get("status", "ok")).lower().strip(),
-                bureaus=str(row.get("bureaus", "Unknown")),
-                account_type=str(row.get("account_type", "unknown")).lower().strip(),
-                is_negative=bool(row.get("is_negative", False)),
-                notes=str(row.get("notes", "")),
-            )
+        st.divider()
+        st.subheader("Account Snippets (for troubleshooting)")
+        for i, a in enumerate(final_accounts, start=1):
+            title = f"{i}. {a.creditor_name or 'Unknown Creditor'} — {a.negative_type_status or 'Unknown Status'} — {a.masked_account_number}"
+            with st.expander(title):
+                st.caption("Raw block snippet (PII-masked):")
+                st.code(a.raw_block_snippet or "", language="text")
 
-            acct_mask = mask_account_number(tl.account_number)
-            bal_str = "—" if tl.balance is None else f"${tl.balance:,.2f}"
-            title = f"{tl.creditor_name} ({acct_mask}) — {tl.status.upper()} — Balance {bal_str}"
-
-            with st.expander(title, expanded=False):
-                actions = recommend_actions(tl)
-                if not actions:
-                    st.write("No specific actions detected. Consider reviewing for inaccuracies and improving utilization/positive credit.")
-                else:
-                    for a in actions:
-                        lo, hi = a["impact"]
-                        st.markdown(
-                            f"**{a['action']}**  \n"
-                            f"- Why: {a['why']}  \n"
-                            f"- Estimated impact: **+{lo} to +{hi}** points (range)  \n"
-                            f"- Effort: **{a['effort']}**"
-                        )
-
-    st.markdown("### Utilization Helper")
-    if total_rev_lim <= 0:
-        st.info("To compute paydown needed, add **credit_limit** values for revolving accounts in **Parsed Accounts**.")
-    else:
-        util = (total_rev_bal / total_rev_lim) * 100.0
-        st.write(f"Total revolving balance: **${total_rev_bal:,.2f}**")
-        st.write(f"Total revolving limits: **${total_rev_lim:,.2f}**")
-        st.write(f"Estimated utilization: **{util:.1f}%**")
-        st.json(utilization_paydown_helper(total_rev_bal, total_rev_lim))
-
-    st.markdown("### Rapid Rescore Checklist PDF")
-    neg_counts = {
-        "collections": int((df_work["status"].astype(str).str.lower() == "collection").sum()),
-        "charge_offs": int((df_work["status"].astype(str).str.lower() == "charge_off").sum()),
-        "lates": int((df_work["status"].astype(str).str.lower() == "late").sum()),
-    }
-
-    top_actions = ["Lower revolving utilization before rescore (30% → 10% → 1–9%)."]
-    if neg_counts["collections"] > 0:
-        top_actions.append("Prioritize collections for deletion outcomes (PFD or verified disputes).")
-    if neg_counts["charge_offs"] > 0:
-        top_actions.append("Settle/pay charge-offs and ensure bureau updates to $0 balance.")
-    if neg_counts["lates"] > 0:
-        top_actions.append("Request goodwill removals for isolated lates; prevent new lates via autopay.")
-    top_actions.append("Prepare documentation for rapid rescore submission (receipts/letters/statements).")
-
-    neg_tls = df_to_tradelines(neg_df)
-
-    pdf_bytes = build_checklist_pdf_bytes(
-        score_lo=score_lo,
-        score_hi=score_hi,
-        goal_score=int(goal_score),
-        top_actions=top_actions,
-        negative_lines=neg_tls,
-    )
-
-    st.download_button(
-        "⬇️ Download Rapid Rescore Checklist (PDF)",
-        data=pdf_bytes,
-        file_name="Rapid_Rescore_Checklist.pdf",
-        mime="application/pdf",
-        use_container_width=True,
-        key="download_checklist_pdf",
-    )
-
-
-# =============================================================================
-# What-If Simulator
-# =============================================================================
-with tab_sim:
-    st.subheader("What-If Simulator")
-    st.caption("Toggle actions to see a **range-based** estimated score change. Combined scenarios are **not additive**.")
-
+    st.divider()
     colA, colB = st.columns([1, 1])
     with colA:
-        util_target = st.slider("Utilization target (%)", min_value=1, max_value=100, value=30, step=1, key="util_target_slider")
-        remove_collections = st.checkbox("Remove/delete collections (PFD or successful dispute)", key="toggle_remove_collections")
-        remove_chargeoffs = st.checkbox("Remove/fix charge-offs (delete or major correction)", key="toggle_remove_chargeoffs")
-        remove_lates = st.checkbox("Remove late payments (goodwill / correction)", key="toggle_remove_lates")
-
+        pdf_bytes_out = build_export_pdf(final_df, mode, confidence, overall_pressure)
+        st.download_button(
+            "⬇️ Export PDF: Negative Accounts Summary.pdf",
+            data=pdf_bytes_out,
+            file_name="Negative Accounts Summary.pdf",
+            mime="application/pdf",
+            use_container_width=True,
+        )
     with colB:
-        add_authorized_user = st.checkbox("Add strong authorized user (aged + low utilization)", key="toggle_add_au")
-        add_new_revolver = st.checkbox("Add new revolving account (if appropriate)", key="toggle_new_revolver")
-        months_pass = st.slider("Time passing (months)", min_value=0, max_value=24, value=0, step=1, key="months_pass_slider")
+        st.info("Export includes a disclaimer and the current table (after Manual Fix overrides).")
 
-    toggles = {
-        "util_target": util_target,
-        "remove_collections": remove_collections,
-        "remove_chargeoffs": remove_chargeoffs,
-        "remove_lates": remove_lates,
-        "add_authorized_user": add_authorized_user,
-        "add_new_revolver": add_new_revolver,
-        "months_pass": months_pass,
-    }
+with tab2:
+    st.subheader("Manual Fix (Live Overrides)")
+    st.caption("Edit values below to override parsing results. Account numbers remain masked (last 4).")
 
-    sim_lo, sim_hi, sim_dbg = combined_scenario_adjustment(score_lo, score_hi, toggles)
-    delta_lo = sim_lo - score_lo
-    delta_hi = sim_hi - score_hi
-
-    st.markdown("### Scenario Result")
-    r1, r2, r3 = st.columns(3)
-    r1.metric("Current Range", f"{score_lo}–{score_hi}")
-    r2.metric("Scenario Range", f"{sim_lo}–{sim_hi}")
-    r3.metric("Estimated Delta", f"+{delta_lo} to +{delta_hi}")
-
-    st.markdown("### Why it’s not additive")
-    st.write(
-        "Real scoring models have **interaction effects** (e.g., removing collections and lowering utilization overlap). "
-        "This simulator applies **diminishing returns** when multiple actions are selected."
+    editable = st.data_editor(
+        state["manual_df"],
+        use_container_width=True,
+        hide_index=True,
+        num_rows="fixed",
+        column_config={
+            "RowID": st.column_config.NumberColumn("RowID", disabled=True),
+            "Balance (number)": st.column_config.NumberColumn("Balance (number)", format="%.2f", step=1.0),
+            "Last Reported (YYYY-MM-DD)": st.column_config.TextColumn("Last Reported (YYYY-MM-DD)"),
+            "Opened (YYYY-MM-DD)": st.column_config.TextColumn("Opened (YYYY-MM-DD)"),
+        },
+        key="manual_editor",
     )
-    with st.expander("Scenario math details (debuggable)"):
-        st.json(sim_dbg)
 
+    # Save edits instantly
+    state["manual_df"] = editable
 
-# =============================================================================
-# Debug
-# =============================================================================
-with tab_debug:
+    st.divider()
+    updated_accounts = apply_manual_overrides(state["base_accounts"], state["manual_df"])
+    updated_df = to_table_df(updated_accounts)
+    st.subheader("Preview: Updated Negative Accounts Table")
+    st.dataframe(updated_df, use_container_width=True, hide_index=True)
+
+    st.caption("Tip: Use YYYY-MM-DD for dates (example: 2024-11-15). MM/YYYY and MM/DD/YYYY also usually work.")
+
+with tab3:
     st.subheader("Debug")
-    st.caption("Raw text preview, detected bureaus, extraction metadata, and block previews.")
+    if debug_warnings:
+        for w in debug_warnings:
+            st.warning(w)
 
-    st.markdown("### Detected Bureau(s)")
-    st.write(st.session_state.get("bureaus", ["Unknown"]))
+    st.markdown("### Extraction Details")
+    st.write({
+        "Extraction Mode": mode,
+        "Confidence": confidence,
+        "Text Length": int(state["conf_debug"]["text_length"]),
+        "Completion Rate": round(state["conf_debug"]["completion_rate"], 3),
+        "Confidence Score": round(state["conf_debug"]["score"], 3),
+        "Detected Bureaus": doc_bureaus if doc_bureaus else ["Unknown"],
+        "Blocks Detected": len(state["blocks"]),
+        "Negative Blocks Parsed": len(state["base_accounts"]),
+    })
 
-    st.markdown("### Extraction Metadata")
-    st.json(st.session_state.get("extraction_meta", {}))
+    st.markdown("### Field Extraction Notes (per parsed negative block)")
+    note_rows = []
+    for n in state["parse_notes"]:
+        note_rows.append({
+            "Block Index": n.block_index,
+            "Notes": " | ".join(n.notes),
+        })
+    st.dataframe(pd.DataFrame(note_rows), use_container_width=True, hide_index=True)
 
-    st.markdown("### Parse Debug")
-    st.json(st.session_state.get("parse_debug", {}))
+    st.markdown("### Raw Extracted Text Preview (PII-masked best-effort)")
+    preview = mask_pii_in_snippet((extracted_text or "")[:12000])
+    st.code(preview, language="text")
 
-    st.markdown("### Raw Extracted Text (preview)")
-    st.code(safe_snip(st.session_state.get("raw_text", ""), 4000))
-
-    blocks_preview = st.session_state.get("parse_debug", {}).get("raw_blocks_preview", [])
-    if blocks_preview:
-        st.markdown("### Detected Blocks (preview)")
-        for i, b in enumerate(blocks_preview, start=1):
-            with st.expander(f"Block {i}", expanded=False):
-                st.code(safe_snip(b, 2500))
+    st.markdown("### Parsed Block List (first 30 blocks, PII-masked)")
+    for i, blk in enumerate(state["blocks"][:30]):
+        with st.expander(f"Block #{i}"):
+            st.code(mask_pii_in_snippet(blk[:2000]), language="text")
