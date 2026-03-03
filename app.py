@@ -1047,10 +1047,14 @@ with st.sidebar:
     st.write(f"Max OCR pages: **{MAX_PAGES_OCR}**")
     st.caption("Large PDFs can be slow on Streamlit Cloud. If your report is long, OCR will cap pages for reliability.")
 
-    run_btn = st.button("Process PDF", type="primary", use_container_width=True)
+    run_btn = st.button(
+    "Process PDF",
+    type="primary",
+    use_container_width=True,
+    key="process_pdf_button"
+)
 
 # ----------------------------
-# Process PDF
 # ----------------------------
 if run_btn:
     if not uploaded:
@@ -1120,7 +1124,6 @@ working_df = st.session_state["edited_df"] if st.session_state["edited_df"] is n
 
 # If no data yet, show friendly empty state
 if working_df is None or working_df.empty:
-    st.info("Upload a credit bureau PDF and click **Process PDF** to begin.")
     st.stop()
 
 # Always mask account display for UI
