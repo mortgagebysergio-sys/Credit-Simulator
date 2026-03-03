@@ -823,30 +823,220 @@ def _dedupe_accounts(accounts: List[NegativeAccount]) -> List[NegativeAccount]:
 # Export PDF (ReportLab)
 # =============================
 def build_export_pdf(df: pd.DataFrame, extraction_mode: str, confidence: str, overall_pressure: str) -> bytes:
+    """
+    Export a clean, readable PDF:
+      - Landscape letter to prevent horizontal cutoff
+      - Forced column widths to fit page
+      - Wrapped text cells (Paragraph) so long text doesn't blow out width
+      - Auto shrink-to-fit for unusually long creditor names
+      - Two-page format when needed:
+          Page 1 = Summary
+          Page 2+ = Detailed table (split into chunks if many rows)
+    """
+    from reportlab.lib.pagesizes import letter, landscape
+    from reportlab.platypus import (
+        SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
+    )
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib import colors
+
     buffer = io.BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=letter, rightMargin=36, leftMargin=36, topMargin=36, bottomMargin=36)
+    pagesize = landscape(letter)
+
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=pagesize,
+        rightMargin=24,
+        leftMargin=24,
+        topMargin=24,
+        bottomMargin=24,
+    )
+
     styles = getSampleStyleSheet()
+
+    # Base small text style
+    small = ParagraphStyle(
+        "small",
+        parent=styles["Normal"],
+        fontName="Helvetica",
+        fontSize=7.5,
+        leading=9,
+    )
+    small_bold = ParagraphStyle(
+        "small_bold",
+        parent=small,
+        fontName="Helvetica-Bold",
+    )
+
+    # Even smaller style used only when creditor name is unusually long
+    small_tight = ParagraphStyle(
+        "small_tight",
+        parent=small,
+        fontSize=6.8,
+        leading=8.2,
+    )
+
+    def esc(s: str) -> str:
+        return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    def P(val, bold: bool = False, tight: bool = False):
+        txt = esc("" if val is None else str(val))
+        if bold:
+            return Paragraph(txt, small_bold)
+        if tight:
+            return Paragraph(txt, small_tight)
+        return Paragraph(txt, small)
+
+    cols = [
+        "Creditor", "Acct (Last 4)", "Balance", "Last Reported", "Opened", "Age",
+        "Negative Type/Status", "Bureau(s)", "Estimated Impact"
+    ]
+
     story = []
 
+    # --------------------
+    # Page 1: Summary
+    # --------------------
     story.append(Paragraph("Negative Accounts Summary", styles["Title"]))
-    story.append(Spacer(1, 0.15 * inch))
+    story.append(Spacer(1, 10))
 
-    meta = f"Extraction Mode: {extraction_mode} | Confidence: {confidence} | Overall Negative Pressure: {overall_pressure}"
-    story.append(Paragraph(meta, styles["Normal"]))
-    story.append(Spacer(1, 0.20 * inch))
+    story.append(Paragraph(
+        f"Extraction Mode: {esc(extraction_mode)} | Confidence: {esc(confidence)} | Overall Negative Pressure: {esc(overall_pressure)}",
+        styles["Normal"]
+    ))
+    story.append(Spacer(1, 10))
 
     disclaimer = (
         "Disclaimer: This report is an informational extraction from the uploaded Birchwood credit report PDF. "
         "Estimated impact ranges are heuristic (not an exact score change) and vary by scoring model, file thickness, "
         "utilization, and reporting details. Always verify against the source report."
     )
-    story.append(Paragraph(disclaimer, styles["Italic"]))
-    story.append(Spacer(1, 0.25 * inch))
+    story.append(Paragraph(esc(disclaimer), styles["Italic"]))
+    story.append(Spacer(1, 14))
 
+    # Quick counts (page 1)
     if df.empty:
         story.append(Paragraph("No negative accounts detected.", styles["Normal"]))
         doc.build(story)
         return buffer.getvalue()
+
+    # Summary stats
+    try:
+        # Balance column is formatted like "$1,234.00" in your df.
+        # Best effort: strip non-numeric to compute total
+        bal_nums = (
+            df["Balance"]
+            .astype(str)
+            .str.replace(r"[^0-9.]", "", regex=True)
+            .replace("", "0")
+            .astype(float)
+        )
+        total_balance = float(bal_nums.sum())
+    except Exception:
+        total_balance = None
+
+    def count_contains(col: str, needle: str) -> int:
+        if col not in df.columns:
+            return 0
+        return int(df[col].astype(str).str.lower().str.contains(needle.lower()).sum())
+
+    n_total = len(df)
+    n_col = count_contains("Negative Type/Status", "collection")
+    n_co = count_contains("Negative Type/Status", "charge")
+    n_late = count_contains("Negative Type/Status", "late")
+
+    summary_table = [
+        ["Total negative accounts", str(n_total)],
+        ["Collections", str(n_col)],
+        ["Charge-offs", str(n_co)],
+        ["Lates", str(n_late)],
+        ["Total negative balance", format_money(total_balance) if total_balance is not None else ""],
+    ]
+
+    summary_tbl = Table(summary_table, colWidths=[250, 200])
+    summary_tbl.setStyle(TableStyle([
+        ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+        ("BACKGROUND", (0, 0), (-1, -1), colors.whitesmoke),
+        ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 10),
+        ("LEFTPADDING", (0, 0), (-1, -1), 6),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+    ]))
+    story.append(summary_tbl)
+
+    story.append(Spacer(1, 12))
+    story.append(Paragraph("Detailed table on next page.", styles["Normal"]))
+
+    # --------------------
+    # Page 2+: Detailed table
+    # --------------------
+    story.append(PageBreak())
+    story.append(Paragraph("Detailed Negative Accounts", styles["Heading2"]))
+    story.append(Spacer(1, 8))
+
+    # Force table width to page width
+    page_w, _ = pagesize
+    usable_w = page_w - doc.leftMargin - doc.rightMargin
+
+    # Column width proportions (sum ~ 1.0)
+    proportions = [0.18, 0.09, 0.09, 0.09, 0.08, 0.06, 0.16, 0.10, 0.15]
+    col_widths = [usable_w * p for p in proportions]
+
+    # Build in chunks so extremely long lists don't become unreadable
+    # Each chunk becomes its own table; header repeats automatically per table.
+    max_rows_per_table = 28  # tuned for landscape letter readability
+
+    rows = df[cols].copy()
+
+    # Build data with wrapped paragraphs; shrink creditor font when unusually long
+    def build_table_data(sub_df: pd.DataFrame) -> list:
+        data = [[P(c, bold=True) for c in cols]]
+        for _, r in sub_df.iterrows():
+            creditor_txt = str(r.get("Creditor", "") or "")
+            tight = len(creditor_txt) > 26  # shrink-to-fit threshold
+            data.append([
+                P(creditor_txt, tight=tight),
+                P(r.get("Acct (Last 4)", "")),
+                P(r.get("Balance", "")),
+                P(r.get("Last Reported", "")),
+                P(r.get("Opened", "")),
+                P(r.get("Age", "")),
+                P(r.get("Negative Type/Status", "")),
+                P(r.get("Bureau(s)", "")),
+                P(r.get("Estimated Impact", "")),
+            ])
+        return data
+
+    # Split into multiple tables if too many rows
+    for start in range(0, len(rows), max_rows_per_table):
+        sub = rows.iloc[start:start + max_rows_per_table]
+        table_data = build_table_data(sub)
+
+        tbl = Table(table_data, colWidths=col_widths, repeatRows=1)
+        tbl.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.black),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 4),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+            ("TOPPADDING", (0, 0), (-1, -1), 3),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.whitesmoke, colors.lightgrey]),
+        ]))
+
+        story.append(tbl)
+
+        # If more chunks remain, add a page break between them
+        if start + max_rows_per_table < len(rows):
+            story.append(PageBreak())
+            story.append(Paragraph("Detailed Negative Accounts (continued)", styles["Heading2"]))
+            story.append(Spacer(1, 8))
+
+    doc.build(story)
+    return buffer.getvalue()
 
     cols = [
         "Creditor", "Acct (Last 4)", "Balance", "Last Reported", "Opened", "Age",
