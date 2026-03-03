@@ -3,7 +3,7 @@ import re
 import math
 from dataclasses import dataclass
 from datetime import datetime, date
-from typing import List, Dict, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 
 import pandas as pd
 import streamlit as st
@@ -22,9 +22,8 @@ from reportlab.lib.styles import getSampleStyleSheet
 # =============================
 # App Config
 # =============================
-st.set_page_config(page_title="Negative Accounts Extractor", page_icon="📄", layout="wide")
+st.set_page_config(page_title="Birchwood Negative Accounts Extractor", page_icon="📄", layout="wide")
 TODAY = date.today()
-
 
 # =============================
 # PII masking helpers
@@ -39,6 +38,7 @@ def mask_account_number(raw: str) -> str:
     digits = re.sub(r"\D", "", raw)
     if len(digits) >= 4:
         return f"••••{digits[-4:]}"
+    # Birchwood sometimes uses alphanumeric IDs; still mask as unknown
     return "••••"
 
 
@@ -59,7 +59,7 @@ def mask_pii_in_snippet(text: str) -> str:
 
 
 # =============================
-# Date helpers
+# Date + Money helpers (Birchwood uses MM/YY often)
 # =============================
 def parse_mm_yy(s: str) -> Optional[date]:
     s = (s or "").strip()
@@ -94,9 +94,6 @@ def calc_age(opened: Optional[date]) -> str:
     return f"{years} yr {rem} mo"
 
 
-# =============================
-# Money helpers
-# =============================
 MONEY_RE = re.compile(r"(?i)\$?\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{2})?|[0-9]+(?:\.[0-9]{2})?)")
 
 
@@ -123,44 +120,7 @@ def format_money(x: Optional[float]) -> str:
 
 
 # =============================
-# Bureau detection helpers
-# =============================
-def detect_bureau(text: str) -> List[str]:
-    t = (text or "").lower()
-    bureaus = []
-    if "experian" in t:
-        bureaus.append("Experian")
-    if "equifax" in t:
-        bureaus.append("Equifax")
-    if "transunion" in t or "trans union" in t:
-        bureaus.append("TransUnion")
-    return bureaus
-
-
-def detect_bureaus_from_source_line(block: str) -> str:
-    """
-    Birchwood format commonly shows: XP/TU/EF or TU/EF etc (see sample) :contentReference[oaicite:3]{index=3}
-    """
-    t = (block or "").upper()
-
-    found = []
-    if "XP" in t or "EX" in t:
-        found.append("Experian")
-    if "TU" in t:
-        found.append("TransUnion")
-    if "EF" in t or "EQ" in t:
-        found.append("Equifax")
-
-    found = list(dict.fromkeys(found))
-    if not found:
-        return "Unknown"
-    if len(found) == 1:
-        return found[0]
-    return "/".join(found)
-
-
-# =============================
-# Extraction pipeline
+# Extraction pipeline (Text then OCR)
 # =============================
 def extract_text_pymupdf(pdf_bytes: bytes) -> str:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -186,7 +146,7 @@ def extract_text_ocr(pdf_bytes: bytes, dpi: int = 220) -> str:
 
 
 # =============================
-# Data models
+# Models
 # =============================
 @dataclass
 class ParseNote:
@@ -209,13 +169,280 @@ class NegativeAccount:
 
 
 # =============================
-# Impact estimator (unchanged)
+# Birchwood-specific parsing
 # =============================
-def impact_range_for_account(
-    neg_type: str,
-    last_reported: Optional[date],
-    balance: Optional[float],
-) -> Tuple[str, str]:
+HEADER_NOISE_PREFIXES = (
+    "FILE #", "SEND TO", "CUST.", "BIRCHWOOD CREDIT SERVICES",
+    "ECOA KEY:", "PROPERTY ADDRESS", "APPLICANT", "SOC SEC",
+    "MARITAL STATUS", "The information is furnished",
+)
+
+def is_header_noise(line: str) -> bool:
+    s = (line or "").strip()
+    if not s:
+        return True
+    for p in HEADER_NOISE_PREFIXES:
+        if s.startswith(p):
+            return True
+    if s.startswith("Page "):
+        return True
+    return False
+
+
+def is_account_id_line(line: str) -> bool:
+    """
+    Birchwood account IDs can be digits or alphanumeric (e.g., M318R2G9).
+    """
+    s = (line or "").strip()
+    if not s:
+        return False
+    # avoid MM/YY
+    if re.fullmatch(r"(0?[1-9]|1[0-2])[/\-]\d{2,4}", s):
+        return False
+    # all digits
+    if re.fullmatch(r"\d{7,}", s):
+        return True
+    # alphanumeric
+    if re.fullmatch(r"[A-Z0-9]{6,}", s.upper()):
+        if s.upper() in {"OPENED", "REPORTED", "BALANCE", "PAYMENT", "PAST", "DUE"}:
+            return False
+        return True
+    return False
+
+
+def detect_bureaus_from_block(block: str) -> str:
+    t = (block or "").upper()
+    found = []
+    if "XP" in t or "EX" in t:
+        found.append("Experian")
+    if "TU" in t:
+        found.append("TransUnion")
+    if "EF" in t or "EQ" in t:
+        found.append("Equifax")
+    found = list(dict.fromkeys(found))
+    if not found:
+        return "Unknown"
+    if len(found) == 1:
+        return found[0]
+    return "/".join(found)
+
+
+def extract_section(text: str, start_marker: str, end_marker: Optional[str]) -> str:
+    t = (text or "")
+    si = t.upper().find(start_marker.upper())
+    if si < 0:
+        return ""
+    sub = t[si:]
+    if end_marker:
+        ei = sub.upper().find(end_marker.upper())
+        if ei > 0:
+            sub = sub[:ei]
+    return sub
+
+
+def birchwood_negative_status(block: str) -> Tuple[bool, str]:
+    """
+    Birchwood negatives:
+      - CHARGE OFF / COLLECTION
+      - DELINQ 30/60/90
+      - delinquency bucket counts 30-59 / 60-89 / 90+
+    """
+    t = (block or "").upper()
+
+    if "CHARGE OFF" in t or "CHARGED OFF" in t:
+        return True, "Charge-off"
+    if re.search(r"\bCOLLECTION\b", t):
+        return True, "Collection"
+
+    m = re.search(r"\bDELINQ\s*(30|60|90|120)\b", t)
+    if m:
+        n = m.group(1)
+        if n == "120":
+            return True, "Late (120+)"
+        return True, f"Late ({n})"
+
+    # bucket counts
+    def count_bucket(label: str) -> int:
+        m2 = re.search(rf"(?i){re.escape(label)}\s*\n\s*(\d+)", block)
+        return int(m2.group(1)) if m2 else 0
+
+    c90 = count_bucket("90+")
+    c60 = count_bucket("60-89")
+    c30 = count_bucket("30-59")
+
+    if c90 > 0:
+        return True, "Late (90)"
+    if c60 > 0:
+        return True, "Late (60)"
+    if c30 > 0:
+        return True, "Late (30)"
+
+    # Other public record style keywords (rare but possible)
+    if "BANKRUPT" in t or "CHAPTER 7" in t or "CHAPTER 13" in t:
+        return True, "Bankruptcy"
+    if "FORECLOS" in t:
+        return True, "Foreclosure"
+    if "REPOS" in t:
+        return True, "Repossession"
+    if "JUDG" in t:
+        return True, "Judgment"
+
+    return False, ""
+
+
+def build_birchwood_tradeline_blocks(full_text: str) -> Tuple[List[str], List[str]]:
+    """
+    Build one block per tradeline from TRADELINES section.
+    """
+    notes = []
+    tradelines_text = extract_section(full_text, "TRADELINES", "TRADE SUMMARY")
+    if not tradelines_text:
+        return [], ["Birchwood parser: TRADELINES section not found."]
+
+    lines = [ln.rstrip() for ln in tradelines_text.splitlines()]
+    lines = [ln for ln in lines if ln.strip()]
+
+    blocks = []
+    i = 0
+
+    def looks_like_start(idx: int) -> bool:
+        if idx >= len(lines) - 1:
+            return False
+        a = lines[idx].strip()
+        b = lines[idx + 1].strip()
+        if is_header_noise(a):
+            return False
+        # creditor-ish line followed by account id soon
+        if is_account_id_line(b):
+            return True
+        if idx + 2 < len(lines) and is_account_id_line(lines[idx + 2].strip()):
+            return True
+        return False
+
+    while i < len(lines):
+        if not looks_like_start(i):
+            i += 1
+            continue
+
+        creditor_lines = []
+        j = i
+        while j < len(lines) and not is_account_id_line(lines[j].strip()):
+            if not is_header_noise(lines[j]):
+                creditor_lines.append(lines[j].strip())
+            j += 1
+
+        if j >= len(lines):
+            break
+
+        acct_line = lines[j].strip()
+        j += 1
+
+        # optional numeric suffix line
+        suffix = ""
+        if j < len(lines) and re.fullmatch(r"\d{1,3}", lines[j].strip()):
+            suffix = lines[j].strip()
+            j += 1
+
+        k = j
+        while k < len(lines) and not looks_like_start(k):
+            k += 1
+
+        blk_lines = creditor_lines + [acct_line] + ([suffix] if suffix else []) + lines[j:k]
+        blk = "\n".join(blk_lines).strip()
+        if blk:
+            blocks.append(blk)
+        i = k
+
+    notes.append(f"Birchwood parser: built {len(blocks)} tradeline blocks from TRADELINES.")
+    return blocks, notes
+
+
+def parse_birchwood_tradeline(block: str) -> Tuple[NegativeAccount, List[str]]:
+    notes = []
+    lines = [ln.strip() for ln in (block or "").splitlines() if ln.strip()]
+
+    creditor_parts = []
+    acct_raw = ""
+    idx = 0
+    while idx < len(lines):
+        if is_account_id_line(lines[idx]):
+            acct_raw = lines[idx]
+            idx += 1
+            if idx < len(lines) and re.fullmatch(r"\d{1,3}", lines[idx]):
+                acct_raw = acct_raw + lines[idx]
+                idx += 1
+            break
+        creditor_parts.append(lines[idx])
+        idx += 1
+
+    creditor = " ".join(creditor_parts).strip()
+    creditor = re.sub(r"\s{2,}", " ", creditor)[:90]
+    notes.append("Creditor: leading lines" if creditor else "Creditor: missing")
+
+    if not acct_raw:
+        m = ACCT_LIKE_RE.search(block or "")
+        acct_raw = m.group(0) if m else ""
+        notes.append("Account#: heuristic fallback" if acct_raw else "Account#: missing")
+    else:
+        notes.append("Account#: account-id line")
+
+    masked_acct = mask_account_number(acct_raw)
+
+    opened_dt = None
+    reported_dt = None
+    bal = None
+
+    m = re.search(r"(?i)\bOpened\b\s*\n\s*([0-9]{1,2}[/\-][0-9]{2,4})", block)
+    if m:
+        opened_dt = parse_mm_yy(m.group(1))
+        notes.append("Opened: label match")
+    else:
+        notes.append("Opened: missing")
+
+    m = re.search(r"(?i)\bReported\b\s*\n\s*([0-9]{1,2}[/\-][0-9]{2,4})", block)
+    if m:
+        reported_dt = parse_mm_yy(m.group(1))
+        notes.append("Reported/Last reported: label match")
+    else:
+        notes.append("Reported/Last reported: missing")
+
+    m = re.search(r"(?i)\bBalance\b\s*\n\s*(\$?\s*[0-9,]+(?:\.[0-9]{2})?)", block)
+    if m:
+        bal = parse_money(m.group(1))
+        notes.append("Balance: label match")
+    else:
+        m2 = re.search(r"(?i)\bBalance\b[^0-9$]{0,10}(\$?\s*[0-9,]+(?:\.[0-9]{2})?)", block)
+        if m2:
+            bal = parse_money(m2.group(1))
+            notes.append("Balance: inline fallback")
+        else:
+            notes.append("Balance: missing")
+
+    bureaus = detect_bureaus_from_block(block)
+    notes.append(f"Bureaus: {bureaus}")
+
+    is_neg, status = birchwood_negative_status(block)
+    notes.append(f"Negative: {is_neg} ({status})")
+
+    acct = NegativeAccount(
+        creditor_name=creditor,
+        masked_account_number=masked_acct,
+        current_balance=bal,
+        last_reported_date=reported_dt,
+        date_opened=opened_dt,
+        age_of_account=calc_age(opened_dt),
+        negative_type_status=status,
+        bureaus=bureaus,
+        estimated_impact="",  # set later
+        raw_block_snippet=mask_pii_in_snippet((block or "")[:1600]),
+    )
+    return acct, notes
+
+
+# =============================
+# Impact estimator (heuristics)
+# =============================
+def impact_range_for_account(neg_type: str, last_reported: Optional[date], balance: Optional[float]) -> Tuple[str, str]:
     t = (neg_type or "").lower()
     bal = balance or 0.0
 
@@ -256,8 +483,6 @@ def impact_range_for_account(
         base, tier = (12, 45), "Moderate"
     elif "late (30" in t:
         base, tier = (5, 25), "Low"
-    elif "late" in t or "delinquent" in t:
-        base, tier = (8, 35), "Low–Moderate"
     else:
         base, tier = (8, 35), "Low–Moderate"
 
@@ -286,7 +511,6 @@ def impact_range_for_account(
 def overall_negative_pressure(accounts: List[NegativeAccount]) -> str:
     if not accounts:
         return "None detected"
-
     w = 0.0
     for a in accounts:
         t = (a.negative_type_status or "").lower()
@@ -306,8 +530,6 @@ def overall_negative_pressure(accounts: List[NegativeAccount]) -> str:
             w += 1.1
         elif "late (30" in t:
             w += 0.7
-        elif "late" in t or "delinquent" in t:
-            w += 0.8
         else:
             w += 0.6
 
@@ -348,12 +570,10 @@ def compute_confidence(extracted_text: str, accounts: List[NegativeAccount]) -> 
         return True
 
     key_fields = ["creditor_name", "masked_account_number", "current_balance", "negative_type_status", "last_reported_date"]
-    filled_counts = {k: 0 for k in key_fields}
-    for a in accounts:
-        for k in key_fields:
-            filled_counts[k] += 1 if filled(getattr(a, k)) else 0
-
-    completion = sum(filled_counts[k] / n for k in key_fields) / len(key_fields)
+    completion = 0.0
+    for k in key_fields:
+        completion += sum(1 for a in accounts if filled(getattr(a, k))) / n
+    completion /= len(key_fields)
 
     if tlen >= 12000:
         len_score = 1.0
@@ -376,434 +596,7 @@ def compute_confidence(extracted_text: str, accounts: List[NegativeAccount]) -> 
 
 
 # =============================
-# NEW: Birchwood tradeline parsing
-# =============================
-HEADER_NOISE_PREFIXES = (
-    "FILE #", "SEND TO", "CUST.", "BIRCHWOOD CREDIT SERVICES", "The information is furnished",
-    "ECOA KEY:", "PROPERTY ADDRESS", "APPLICANT", "SOC SEC", "MARITAL STATUS",
-)
-
-def is_header_noise(line: str) -> bool:
-    s = (line or "").strip()
-    if not s:
-        return True
-    for p in HEADER_NOISE_PREFIXES:
-        if s.startswith(p):
-            return True
-    if s.startswith("Page "):
-        return True
-    return False
-
-
-def is_account_id_line(line: str) -> bool:
-    """
-    Birchwood account IDs can be:
-      - all digits (length >= 7)
-      - alphanumeric (length >= 6) like M318R2G9 :contentReference[oaicite:4]{index=4}
-    Not dates like 01/26.
-    """
-    s = (line or "").strip()
-    if not s:
-        return False
-    if re.fullmatch(r"(0?[1-9]|1[0-2])[/\-]\d{2,4}", s):
-        return False
-    if re.fullmatch(r"\d{7,}", s):
-        return True
-    if re.fullmatch(r"[A-Z0-9]{6,}", s.upper()):
-        # exclude obvious label tokens
-        if s.upper() in {"OPENED", "REPORTED", "BALANCE", "PAYMENT", "PAST", "DUE"}:
-            return False
-        return True
-    # allow mixed with trailing letters (student loan patterns)
-    if re.fullmatch(r"[0-9]{8,}[A-Z][A-Z0-9]{2,}", s.upper()):
-        return True
-    return False
-
-
-def extract_section(text: str, start_marker: str, end_marker: Optional[str]) -> str:
-    t = (text or "")
-    si = t.upper().find(start_marker.upper())
-    if si < 0:
-        return ""
-    sub = t[si:]
-    if end_marker:
-        ei = sub.upper().find(end_marker.upper())
-        if ei > 0:
-            sub = sub[:ei]
-    return sub
-
-
-def build_birchwood_tradeline_blocks(full_text: str) -> Tuple[List[str], List[str]]:
-    """
-    Returns (blocks, debug_notes)
-    We focus on TRADELINES section, because it has consistent creditor/acct/date/balance structure in your sample :contentReference[oaicite:5]{index=5}
-    """
-    notes = []
-    tradelines_text = extract_section(full_text, "TRADELINES", "TRADE SUMMARY")
-    if not tradelines_text:
-        return [], ["Birchwood tradeline parser: TRADELINES section not found."]
-
-    lines = [ln.rstrip() for ln in tradelines_text.splitlines()]
-    lines = [ln for ln in lines if ln.strip()]
-
-    blocks = []
-    i = 0
-
-    def looks_like_start(idx: int) -> bool:
-        if idx >= len(lines) - 1:
-            return False
-        a = lines[idx].strip()
-        b = lines[idx + 1].strip()
-        if is_header_noise(a):
-            return False
-        # start when we have a creditor-ish line and an account ID next (or within next 2 lines)
-        if is_account_id_line(b):
-            return True
-        if idx + 2 < len(lines) and is_account_id_line(lines[idx + 2].strip()):
-            return True
-        return False
-
-    while i < len(lines):
-        if not looks_like_start(i):
-            i += 1
-            continue
-
-        start = i
-
-        # Gather creditor name lines until we hit account id
-        creditor_lines = []
-        j = i
-        while j < len(lines) and not is_account_id_line(lines[j].strip()):
-            if not is_header_noise(lines[j]):
-                creditor_lines.append(lines[j].strip())
-            j += 1
-
-        if j >= len(lines):
-            break
-
-        # account id line
-        acct_line = lines[j].strip()
-        j += 1
-
-        # Some accounts have a short suffix line after acct (e.g., CORNERSTONE ... "01") :contentReference[oaicite:6]{index=6}
-        suffix = ""
-        if j < len(lines) and re.fullmatch(r"\d{1,3}", lines[j].strip()):
-            suffix = lines[j].strip()
-            j += 1
-
-        # Now gather rest until next start
-        k = j
-        while k < len(lines) and not looks_like_start(k):
-            k += 1
-
-        blk_lines = creditor_lines + [acct_line] + ([suffix] if suffix else []) + lines[j:k]
-        blk = "\n".join(blk_lines).strip()
-        if blk:
-            blocks.append(blk)
-        i = k
-
-    notes.append(f"Birchwood tradeline parser: built {len(blocks)} tradeline blocks from TRADELINES section.")
-    return blocks, notes
-
-
-def birchwood_negative_status(block: str) -> Tuple[bool, str]:
-    """
-    Detect negatives in Birchwood tradelines:
-      - "DELINQ 30/60/90" appears as explicit status :contentReference[oaicite:7]{index=7}
-      - "CHARGE OFF" explicit :contentReference[oaicite:8]{index=8}
-      - "COLLECTION" explicit :contentReference[oaicite:9]{index=9}
-      - delinquency buckets 30-59 / 60-89 / 90+ with counts :contentReference[oaicite:10]{index=10}
-    """
-    t = (block or "").upper()
-
-    if "CHARGE OFF" in t or "CHARGED OFF" in t:
-        return True, "Charge-off"
-    if re.search(r"\bCOLLECTION\b", t):
-        return True, "Collection"
-
-    # explicit delinq
-    m = re.search(r"\bDELINQ\s*(30|60|90)\b", t)
-    if m:
-        n = m.group(1)
-        return True, f"Late ({n})" if n in {"30", "60", "90"} else "Late/Delinquent"
-
-    # delinquency buckets with counts (best effort)
-    def find_count(label: str) -> int:
-        m = re.search(rf"{re.escape(label)}\s*\n\s*(\d+)", block, flags=re.IGNORECASE)
-        return int(m.group(1)) if m else 0
-
-    c30 = find_count("30-59")
-    c60 = find_count("60-89")
-    c90 = find_count("90+")
-    if c90 > 0:
-        return True, "Late (90)"
-    if c60 > 0:
-        return True, "Late (60)"
-    if c30 > 0:
-        return True, "Late (30)"
-
-    # 120+ lates line
-    if "120+ LATES" in t or "180 DAYS" in t or "MORE PAST DUE" in t:
-        return True, "Late (120+)"
-
-    return False, ""
-
-
-def parse_birchwood_tradeline(block: str) -> Tuple[NegativeAccount, List[str]]:
-    """
-    Extract creditor/acct/opened/reported/balance/bureaus from Birchwood style block.
-    """
-    notes = []
-    lines = [ln.strip() for ln in (block or "").splitlines() if ln.strip()]
-
-    # creditor = all lines until first account id line
-    creditor_parts = []
-    acct_raw = ""
-    idx = 0
-    while idx < len(lines):
-        if is_account_id_line(lines[idx]):
-            acct_raw = lines[idx]
-            idx += 1
-            # optional suffix line (01/02/03)
-            if idx < len(lines) and re.fullmatch(r"\d{1,3}", lines[idx]):
-                acct_raw = acct_raw + lines[idx]
-                idx += 1
-            break
-        creditor_parts.append(lines[idx])
-        idx += 1
-
-    creditor = " ".join(creditor_parts).replace("  ", " ").strip()
-    creditor = re.sub(r"\s*/\s*", "/", creditor)  # keep "EDUCATION/NELN"
-    creditor = creditor[:90]
-    if creditor:
-        notes.append("Creditor: parsed from leading lines")
-    else:
-        notes.append("Creditor: missing")
-
-    if acct_raw:
-        notes.append("Account#: parsed from account-id line")
-    else:
-        # fallback for safety
-        m = ACCT_LIKE_RE.search(block or "")
-        acct_raw = m.group(0) if m else ""
-        notes.append("Account#: heuristic fallback" if acct_raw else "Account#: missing")
-
-    masked_acct = mask_account_number(acct_raw)
-
-    # Opened/Reported
-    opened_dt = None
-    reported_dt = None
-
-    m = re.search(r"(?i)\bOpened\b\s*\n\s*([0-9]{1,2}[/\-][0-9]{2,4})", block)
-    if m:
-        opened_dt = parse_mm_yy(m.group(1))
-        notes.append("Opened: label match")
-    else:
-        notes.append("Opened: missing")
-
-    m = re.search(r"(?i)\bReported\b\s*\n\s*([0-9]{1,2}[/\-][0-9]{2,4})", block)
-    if m:
-        reported_dt = parse_mm_yy(m.group(1))
-        notes.append("Reported/Last reported: label match")
-    else:
-        notes.append("Reported/Last reported: missing")
-
-    # Balance
-    bal = None
-    m = re.search(r"(?i)\bBalance\b\s*\n\s*(\$?\s*[0-9,]+(?:\.[0-9]{2})?)", block)
-    if m:
-        bal = parse_money(m.group(1))
-        notes.append("Balance: label match")
-    else:
-        # fallback: some lines show “... Balance $XXXX” in-line
-        m2 = re.search(r"(?i)\bBalance\b[^0-9$]{0,10}(\$?\s*[0-9,]+(?:\.[0-9]{2})?)", block)
-        if m2:
-            bal = parse_money(m2.group(1))
-            notes.append("Balance: inline fallback")
-        else:
-            notes.append("Balance: missing")
-
-    # Bureau(s) from XP/TU/EF line
-    bureaus = detect_bureaus_from_source_line(block)
-    notes.append(f"Bureaus: {bureaus}")
-
-    is_neg, status = birchwood_negative_status(block)
-    notes.append(f"Negative: {is_neg} ({status})")
-
-    acct = NegativeAccount(
-        creditor_name=creditor,
-        masked_account_number=masked_acct,
-        current_balance=bal,
-        last_reported_date=reported_dt,
-        date_opened=opened_dt,
-        age_of_account=calc_age(opened_dt),
-        negative_type_status=status,
-        bureaus=bureaus,
-        estimated_impact="",
-        raw_block_snippet=mask_pii_in_snippet((block or "")[:1600]),
-    )
-    return acct, notes
-
-
-# =============================
-# Generic fallback parsing (kept)
-# =============================
-NEG_KEYWORDS_GENERIC = [
-    "collection", "collections", "charge off", "charged off", "charge-off", "charged-off",
-    "late", "past due", "delinquent", "30 days late", "60 days late", "90 days late", "120 days late",
-    "repossession", "repo", "repossessed",
-    "bankruptcy", "bk", "chapter 7", "chapter 13",
-    "foreclosure",
-    "judgment", "judgements",
-    "write off", "written off", "write-off",
-    "delinq 30", "delinq 60", "delinq 90", "120+ lates",
-]
-
-def looks_negative_generic(block_text: str) -> bool:
-    t = (block_text or "").lower()
-    return any(k in t for k in NEG_KEYWORDS_GENERIC)
-
-
-def build_blocks_generic(full_text: str) -> List[str]:
-    t = (full_text or "").replace("\r\n", "\n")
-    paras = [p.strip() for p in re.split(r"\n\s*\n+", t) if p.strip()]
-    if 8 <= len(paras) <= 400:
-        return paras
-
-    lines = [ln for ln in t.splitlines()]
-    hit_idxs = []
-    for i, ln in enumerate(lines):
-        low = ln.lower()
-        if any(k in low for k in NEG_KEYWORDS_GENERIC):
-            hit_idxs.append(i)
-
-    windows = []
-    for idx in hit_idxs:
-        start = max(0, idx - 8)
-        end = min(len(lines), idx + 10)
-        windows.append((start, end))
-
-    windows.sort()
-    merged = []
-    for s, e in windows:
-        if not merged or s > merged[-1][1]:
-            merged.append([s, e])
-        else:
-            merged[-1][1] = max(merged[-1][1], e)
-
-    blocks = []
-    for s, e in merged:
-        blk = "\n".join(lines[s:e]).strip()
-        if blk:
-            blocks.append(blk)
-    return blocks if blocks else [t.strip()]
-
-
-# =============================
-# Orchestrator: Prefer Birchwood tradelines when detected
-# =============================
-def parse_negative_accounts(extracted_text: str) -> Tuple[List[NegativeAccount], List[ParseNote], List[str], List[str]]:
-    notes: List[ParseNote] = []
-    debug_msgs: List[str] = []
-    blocks_for_debug: List[str] = []
-
-    # Heuristic: Birchwood merged reports contain "MERGED INFILE CREDIT REPORT" and "TRADELINES"
-    t_upper = (extracted_text or "").upper()
-    is_birchwood = "MERGED INFILE CREDIT REPORT" in t_upper and "TRADELINES" in t_upper
-
-    accounts: List[NegativeAccount] = []
-
-    if is_birchwood:
-        tradeline_blocks, parser_msgs = build_birchwood_tradeline_blocks(extracted_text)
-        debug_msgs.extend(parser_msgs)
-        blocks_for_debug = tradeline_blocks[:]  # debug view
-
-        for i, blk in enumerate(tradeline_blocks):
-            is_neg, _ = birchwood_negative_status(blk)
-            if not is_neg:
-                continue
-            acct, n = parse_birchwood_tradeline(blk)
-            if acct.negative_type_status:
-                tier, rng = impact_range_for_account(acct.negative_type_status, acct.last_reported_date, acct.current_balance)
-                acct.estimated_impact = f"{tier}: {rng}"
-            accounts.append(acct)
-            notes.append(ParseNote(block_index=i, notes=n))
-    else:
-        # Generic fallback
-        blocks = build_blocks_generic(extracted_text)
-        blocks_for_debug = blocks[:]
-        debug_msgs.append("Using generic parser (non-Birchwood format).")
-
-        # very light extraction in fallback mode (keeps your previous design intent)
-        for i, blk in enumerate(blocks):
-            if not looks_negative_generic(blk):
-                continue
-            # minimal fallback fields: creditor guess = first line, acct guess = any acct token, balance & dates best effort
-            lines = [l.strip() for l in blk.splitlines() if l.strip()]
-            creditor = (lines[0] if lines else "")[:90]
-
-            m = ACCT_LIKE_RE.search(blk)
-            acct_raw = m.group(0) if m else ""
-            masked = mask_account_number(acct_raw)
-
-            bal = None
-            m = re.search(r"(?i)\bBalance\b.*?(\$?\s*[0-9,]+(?:\.[0-9]{2})?)", blk, flags=re.DOTALL)
-            if m:
-                bal = parse_money(m.group(1))
-
-            # dates best effort
-            opened_dt = parse_mm_yy(blk)
-            reported_dt = None
-            m = re.search(r"(?i)\breported\b.*?([0-9]{1,2}[/\-][0-9]{2,4})", blk)
-            if m:
-                reported_dt = parse_mm_yy(m.group(1))
-
-            # status
-            status = "Late/Delinquent"
-            if "collection" in blk.lower():
-                status = "Collection"
-            if "charge off" in blk.lower() or "charged off" in blk.lower():
-                status = "Charge-off"
-
-            bureaus = "/".join(detect_bureau(blk)) or "Unknown"
-
-            acct = NegativeAccount(
-                creditor_name=creditor,
-                masked_account_number=masked,
-                current_balance=bal,
-                last_reported_date=reported_dt,
-                date_opened=opened_dt,
-                age_of_account=calc_age(opened_dt),
-                negative_type_status=status,
-                bureaus=bureaus,
-                estimated_impact="",
-                raw_block_snippet=mask_pii_in_snippet(blk[:1600]),
-            )
-            tier, rng = impact_range_for_account(acct.negative_type_status, acct.last_reported_date, acct.current_balance)
-            acct.estimated_impact = f"{tier}: {rng}"
-            accounts.append(acct)
-            notes.append(ParseNote(block_index=i, notes=["Generic parse used for this block."]))
-
-    # Dedupe by (creditor, last4, status, balance bucket)
-    deduped = []
-    seen = set()
-    for a in accounts:
-        key = (
-            (a.creditor_name or "").lower().strip()[:40],
-            a.masked_account_number,
-            (a.negative_type_status or "").lower(),
-            int((a.current_balance or 0.0) // 10),
-        )
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(a)
-
-    return deduped, notes, blocks_for_debug, debug_msgs
-
-
-# =============================
-# Export PDF (ReportLab)
+# PDF export
 # =============================
 def build_export_pdf(df: pd.DataFrame, extraction_mode: str, confidence: str, overall_pressure: str) -> bytes:
     buffer = io.BytesIO()
@@ -833,15 +626,8 @@ def build_export_pdf(df: pd.DataFrame, extraction_mode: str, confidence: str, ov
         return buffer.getvalue()
 
     cols = [
-        "Creditor",
-        "Acct (Last 4)",
-        "Balance",
-        "Last Reported",
-        "Opened",
-        "Age",
-        "Negative Type/Status",
-        "Bureau(s)",
-        "Estimated Impact",
+        "Creditor", "Acct (Last 4)", "Balance", "Last Reported", "Opened", "Age",
+        "Negative Type/Status", "Bureau(s)", "Estimated Impact"
     ]
     table_data = [cols]
     for _, r in df.iterrows():
@@ -863,7 +649,6 @@ def build_export_pdf(df: pd.DataFrame, extraction_mode: str, confidence: str, ov
         ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
     ]))
     story.append(tbl)
-
     doc.build(story)
     return buffer.getvalue()
 
@@ -908,6 +693,14 @@ def apply_manual_overrides(base_accounts: List[NegativeAccount], edited_df: pd.D
     updated = []
     by_id = {int(r["RowID"]): r for _, r in edited_df.iterrows() if pd.notnull(r.get("RowID"))}
 
+    def parse_iso_or_mm(text: str) -> Optional[date]:
+        if not text:
+            return None
+        try:
+            return datetime.strptime(text, "%Y-%m-%d").date()
+        except ValueError:
+            return parse_mm_yy(text)
+
     for i, a in enumerate(base_accounts):
         r = by_id.get(i)
         if r is None:
@@ -921,14 +714,6 @@ def apply_manual_overrides(base_accounts: List[NegativeAccount], edited_df: pd.D
         open_s = str(r.get("Opened (YYYY-MM-DD)") or "").strip()
         status = str(r.get("Negative Type/Status") or "").strip()
         bureaus = str(r.get("Bureau(s)") or "").strip()
-
-        def parse_iso_or_mm(text: str) -> Optional[date]:
-            if not text:
-                return None
-            try:
-                return datetime.strptime(text, "%Y-%m-%d").date()
-            except ValueError:
-                return parse_mm_yy(text)
 
         last_dt = parse_iso_or_mm(last_s)
         open_dt = parse_iso_or_mm(open_s)
@@ -961,10 +746,10 @@ def apply_manual_overrides(base_accounts: List[NegativeAccount], edited_df: pd.D
 # =============================
 # Streamlit UI
 # =============================
-st.title("📄 Negative Accounts Extractor (PDF → Structured Table)")
-st.caption("Uploads are processed in-memory only. Account numbers are masked by default. OCR fallback enabled for scanned PDFs.")
+st.title("📄 Birchwood Negative Accounts Extractor")
+st.caption("Birchwood-only parser. Uploads processed in-memory. Account numbers masked (last 4). OCR fallback enabled.")
 
-uploaded = st.file_uploader("Upload a credit bureau PDF", type=["pdf"])
+uploaded = st.file_uploader("Upload a Birchwood credit report PDF", type=["pdf"])
 if uploaded is None:
     st.info("Upload a PDF to begin.")
     st.stop()
@@ -979,24 +764,56 @@ with st.spinner("Extracting text..."):
     text_primary = extract_text_pymupdf(pdf_bytes)
     mode = "Text"
     extracted_text = text_primary
-
     if len(text_primary.strip()) < 1200:
         with st.spinner("Low text detected. Running OCR fallback..."):
             extracted_text = extract_text_ocr(pdf_bytes)
             mode = "OCR"
 
-with st.spinner("Parsing negative accounts..."):
-    accounts, parse_notes, debug_blocks, debug_msgs = parse_negative_accounts(extracted_text)
-    confidence, conf_debug = compute_confidence(extracted_text, accounts)
+with st.spinner("Building tradeline blocks + parsing negatives..."):
+    blocks, build_notes = build_birchwood_tradeline_blocks(extracted_text)
+    accounts: List[NegativeAccount] = []
+    parse_notes: List[ParseNote] = []
+
+    for i, blk in enumerate(blocks):
+        is_neg, _ = birchwood_negative_status(blk)
+        if not is_neg:
+            continue
+        acct, notes = parse_birchwood_tradeline(blk)
+        if acct.negative_type_status:
+            tier, rng = impact_range_for_account(acct.negative_type_status, acct.last_reported_date, acct.current_balance)
+            acct.estimated_impact = f"{tier}: {rng}"
+        accounts.append(acct)
+        parse_notes.append(ParseNote(block_index=i, notes=notes))
+
+    # dedupe
+    deduped = []
+    seen = set()
+    for a in accounts:
+        key = (
+            (a.creditor_name or "").lower().strip()[:40],
+            a.masked_account_number,
+            (a.negative_type_status or "").lower(),
+            int((a.current_balance or 0.0) // 10),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(a)
+
+    accounts = deduped
+
+confidence, conf_debug = compute_confidence(extracted_text, accounts)
 
 state["extraction_mode"] = mode
 state["confidence"] = confidence
-state["base_accounts"] = accounts
-state["manual_df"] = state.get("manual_df") or build_manual_editor_df(accounts)
+state["blocks"] = blocks
+state["build_notes"] = build_notes
 state["parse_notes"] = parse_notes
-state["debug_blocks"] = debug_blocks
-state["debug_msgs"] = debug_msgs
 state["conf_debug"] = conf_debug
+state["base_accounts"] = accounts
+
+if "manual_df" not in state:
+    state["manual_df"] = build_manual_editor_df(accounts)
 
 final_accounts = apply_manual_overrides(state["base_accounts"], state["manual_df"])
 final_df = to_table_df(final_accounts)
@@ -1008,7 +825,7 @@ def count_type(substr: str) -> int:
 num_neg = len(final_accounts)
 num_col = count_type("collection")
 num_co = count_type("charge-off") + count_type("charge off")
-num_late = sum(1 for a in final_accounts if "late" in (a.negative_type_status or "").lower() or "delinq" in (a.negative_type_status or "").lower())
+num_late = sum(1 for a in final_accounts if "late" in (a.negative_type_status or "").lower())
 total_bal = sum((a.current_balance or 0.0) for a in final_accounts)
 overall_pressure = overall_negative_pressure(final_accounts)
 
@@ -1020,18 +837,12 @@ c4.metric("# Lates", num_late)
 c5.metric("Total Negative Balance", format_money(total_bal))
 c6.metric("Mode / Confidence", f"{mode} / {confidence}")
 
-with st.expander("How the impact ranges work (important)"):
-    st.write(
-        "Impact is shown as a range (never an exact score). It’s based on negative type, recency, and balance size. "
-        "Real impact varies by scoring model (FICO vs Vantage), credit file thickness, utilization, and reporting details."
-    )
-
 tab1, tab2, tab3 = st.tabs(["Negative Accounts", "Manual Fix", "Debug"])
 
 with tab1:
     st.subheader("Negative Accounts")
     if final_df.empty:
-        st.warning("No negative accounts detected with the current parsing rules.")
+        st.warning("No negative accounts detected.")
     else:
         st.dataframe(final_df, use_container_width=True, hide_index=True)
 
@@ -1055,7 +866,7 @@ with tab1:
 
 with tab2:
     st.subheader("Manual Fix (Live Overrides)")
-    st.caption("Edit values below to override parsing results. Account numbers remain masked (last 4).")
+    st.caption("Edit values below to override parsing. Account numbers remain masked (last 4).")
 
     editable = st.data_editor(
         state["manual_df"],
@@ -1080,8 +891,6 @@ with tab2:
 
 with tab3:
     st.subheader("Debug")
-    for msg in state.get("debug_msgs", []):
-        st.info(msg)
 
     st.markdown("### Extraction Details")
     st.write({
@@ -1090,9 +899,13 @@ with tab3:
         "Text Length": int(state["conf_debug"]["text_length"]),
         "Completion Rate": round(state["conf_debug"]["completion_rate"], 3),
         "Confidence Score": round(state["conf_debug"]["score"], 3),
-        "Parsed Negative Accounts": len(state["base_accounts"]),
-        "Debug Blocks (total)": len(state["debug_blocks"]),
+        "Tradeline Blocks Built": len(state["blocks"]),
+        "Negative Accounts Parsed": len(state["base_accounts"]),
     })
+
+    st.markdown("### Block Builder Notes")
+    for n in state.get("build_notes", []):
+        st.info(n)
 
     st.markdown("### Field Extraction Notes (per parsed negative block)")
     note_rows = [{"Block Index": n.block_index, "Notes": " | ".join(n.notes)} for n in state["parse_notes"]]
@@ -1101,7 +914,7 @@ with tab3:
     st.markdown("### Raw Extracted Text Preview (PII-masked best-effort)")
     st.code(mask_pii_in_snippet((extracted_text or "")[:12000]), language="text")
 
-    st.markdown("### Debug Blocks (first 30, PII-masked)")
-    for i, blk in enumerate(state["debug_blocks"][:30]):
+    st.markdown("### Tradeline Blocks (first 30, PII-masked)")
+    for i, blk in enumerate(state["blocks"][:30]):
         with st.expander(f"Block #{i}"):
-            st.code(mask_pii_in_snippet(blk[:2000]), language="text")
+            st.code(mask_pii_in_snippet(blk[:2200]), language="text")
